@@ -3,6 +3,18 @@ export { Badge, badgeVariants, type BadgeProps } from './badge'
 export { Button, buttonVariants, type ButtonProps } from './button'
 export { Checkbox } from './checkbox'
 export {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogOverlay,
+  DialogPortal,
+  DialogTitle,
+  DialogTrigger,
+} from './dialog'
+export {
   Card,
   CardHeader,
   CardFooter,
@@ -61,4 +73,7 @@ export {
   TableHeader,
   TableRow,
 } from './table'
+export { Skeleton } from './skeleton'
+export { Switch } from './switch'
+export { Tabs, TabsContent, TabsList, TabsTrigger } from './tabs'
 export { Textarea, type TextareaProps } from './textarea'

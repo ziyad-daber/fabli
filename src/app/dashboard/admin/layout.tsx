@@ -20,6 +20,7 @@ import {
   Shield,
   FileText,
   CreditCard,
+  Banknote,
 } from 'lucide-react'
 
 const navigation = [
@@ -29,6 +30,7 @@ const navigation = [
   { name: 'Produits', href: '/dashboard/admin/products', icon: Package },
   { name: 'Commandes', href: '/dashboard/admin/orders', icon: ShoppingBag },
   { name: 'Expéditions', href: '/dashboard/admin/shipments', icon: Truck },
+  { name: 'COD', href: '/dashboard/admin/cod', icon: Banknote },
   { name: 'Commissions', href: '/dashboard/admin/commissions', icon: CreditCard },
   { name: 'Règlements', href: '/dashboard/admin/settlements', icon: FileText },
   { name: 'AMEEX', href: '/dashboard/admin/ameex', icon: Settings },

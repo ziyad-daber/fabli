@@ -16,6 +16,9 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
 # Generate Prisma Client
+# The datasource URL comes from prisma.config.ts (process.env.DATABASE_URL), so a
+# syntactically valid placeholder is required here; it is never used at runtime.
+ENV DATABASE_URL="postgresql://build:build@localhost:5432/build"
 RUN npx prisma generate
 
 # Build the application

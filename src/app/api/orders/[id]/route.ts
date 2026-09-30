@@ -3,64 +3,47 @@ export const dynamic = 'force-dynamic'
 import { auth } from '@/lib/auth/config'
 import { prisma } from '@/lib/db/prisma'
 import { NextResponse } from 'next/server'
-import { OrderStatus, Prisma } from '@prisma/client'
+import { OrderStatus } from '@prisma/client'
 import { z } from 'zod'
-import { generateIdempotencyKey } from '@/lib/utils/helpers'
+import { applyOrderTransition, OrderTransitionError } from '@/lib/orders/transition'
+import { SUPPLIER_ALLOWED } from '@/lib/orders/status'
 
 const updateOrderStatusSchema = z.object({
   status: z.nativeEnum(OrderStatus),
-  notes: z.string().optional(),
-  // For shipment creation
-  trackingCode: z.string().optional(),
-  externalId: z.string().optional(),
-  labelUrl: z.string().optional(),
+  notes: z.string().max(1000).optional(),
+  /** Raison de refus ou d'annulation, conservée sur la commande. */
+  reason: z.string().max(500).optional(),
 })
 
-const validTransitions: Record<OrderStatus, OrderStatus[]> = {
-  PENDING: [OrderStatus.ACCEPTED, OrderStatus.REJECTED, OrderStatus.CANCELLED],
-  ACCEPTED: [OrderStatus.IN_PRODUCTION, OrderStatus.REJECTED, OrderStatus.CANCELLED],
-  IN_PRODUCTION: [OrderStatus.READY_TO_SHIP, OrderStatus.CANCELLED],
-  READY_TO_SHIP: [OrderStatus.SHIPMENT_CREATED, OrderStatus.CANCELLED],
-  SHIPMENT_CREATED: [OrderStatus.IN_TRANSIT, OrderStatus.CANCELLED, OrderStatus.SHIPMENT_ERROR],
-  IN_TRANSIT: [OrderStatus.DELIVERED, OrderStatus.DELIVERY_FAILED, OrderStatus.RETURNED],
-  DELIVERED: [OrderStatus.RETURNED],
-  REJECTED: [],
-  CANCELLED: [],
-  DELIVERY_FAILED: [OrderStatus.RETURNED, OrderStatus.IN_TRANSIT],
-  RETURNED: [],
-  SHIPMENT_ERROR: [OrderStatus.READY_TO_SHIP, OrderStatus.CANCELLED],
+interface RouteContext {
+  params: Promise<{ id: string }>
 }
 
-export async function PATCH(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
+/**
+ * PATCH /api/orders/[id] — changement de statut.
+ *
+ * Le Code Suivi n'est **pas** accepté ici : il provient de l'API AMEEX via
+ * POST /api/shipments, ou d'une saisie manuelle d'administrateur. L'accepter
+ * ici permettrait d'attacher un Code Suivi arbitraire à une commande (§6.4).
+ */
+export async function PATCH(request: Request, { params }: RouteContext) {
   try {
     const session = await auth()
-    const { id } = await params
-    
     if (!session?.user) {
       return NextResponse.json({ error: 'Non autorisé' }, { status: 401 })
     }
 
+    const { id } = await params
     const order = await prisma.order.findUnique({
       where: { id },
-      include: {
-        supplier: true,
-        reseller: true,
-        shipments: true,
-        pickupAddress: true,
-      }
+      include: { supplier: true, reseller: true, shipments: true, pickupAddress: true },
     })
 
     if (!order) {
       return NextResponse.json({ error: 'Commande introuvable' }, { status: 404 })
     }
 
-    // Authorization checks
     const userRole = session.user.role
-    const userId = session.user.id
-
     if (userRole === 'SUPPLIER' && order.supplierId !== session.user.supplierProfile?.id) {
       return NextResponse.json({ error: 'Accès refusé' }, { status: 403 })
     }
@@ -73,7 +56,6 @@ export async function PATCH(
 
     const body = await request.json()
     const validation = updateOrderStatusSchema.safeParse(body)
-    
     if (!validation.success) {
       return NextResponse.json(
         { error: 'Données invalides', details: validation.error.flatten() },
@@ -81,205 +63,111 @@ export async function PATCH(
       )
     }
 
-    const { status: newStatus, notes, trackingCode, externalId, labelUrl } = validation.data
+    const { status: newStatus, notes, reason } = validation.data
 
-    // Validate transition
-    const allowedTransitions = validTransitions[order.status] || []
-    if (!allowedTransitions.includes(newStatus)) {
-      return NextResponse.json(
-        { error: `Transition invalide de ${order.status} vers ${newStatus}` },
-        { status: 400 }
-      )
-    }
-
-    // Additional role-based restrictions
+    // Le revendeur ne fait qu'annuler (§5.3 : annulation de sa commande).
     if (userRole === 'RESELLER' && newStatus !== OrderStatus.CANCELLED) {
       return NextResponse.json(
-        { error: 'Les revendeurs ne peuvent qu\'annuler les commandes' },
+        { error: "Les revendeurs ne peuvent qu'annuler une commande" },
         { status: 403 }
       )
     }
 
-    // Supplier can only move forward in production flow
-    if (userRole === 'SUPPLIER') {
-      const supplierAllowed: OrderStatus[] = [
-        OrderStatus.ACCEPTED,
-        OrderStatus.IN_PRODUCTION,
-        OrderStatus.READY_TO_SHIP,
-        OrderStatus.REJECTED,
-        OrderStatus.CANCELLED,
-      ]
-      if (!supplierAllowed.includes(newStatus)) {
-        return NextResponse.json(
-          { error: 'Action non autorisée pour ce statut' },
-          { status: 403 }
-        )
-      }
+    // Le fournisseur prend en charge et prépare ; il ne gère ni l'expédition
+    // ni la livraison, qui relèvent de l'intégration et du webhook.
+    if (userRole === 'SUPPLIER' && !SUPPLIER_ALLOWED.includes(newStatus)) {
+      return NextResponse.json(
+        { error: 'Action non autorisée pour ce statut' },
+        { status: 403 }
+      )
     }
 
-    // Update order in transaction
-    const updatedOrder = await prisma.$transaction(async (tx) => {
-      const updateData: Record<string, unknown> = { status: newStatus }
-      
-      // Set timestamps based on status
-      const now = new Date()
-      switch (newStatus) {
-        case OrderStatus.ACCEPTED:
-          updateData.acceptedAt = now
-          break
-        case OrderStatus.IN_PRODUCTION:
-          // acceptedAt should already be set
-          break
-        case OrderStatus.READY_TO_SHIP:
-          updateData.producedAt = now
-          updateData.readyToShipAt = now
-          break
-        case OrderStatus.SHIPMENT_CREATED:
-          updateData.shippedAt = now
-          break
-        case OrderStatus.DELIVERED:
-          updateData.deliveredAt = now
-          break
+    // L'expédition se crée par POST /api/shipments : le statut ne peut pas être
+    // posé à la main, sinon la commande afficherait « Expédition créée » sans
+    // Code Suivi.
+    if (newStatus === OrderStatus.SHIPMENT_CREATED) {
+      return NextResponse.json(
+        {
+          error:
+            "Le statut « Expédition créée » est positionné automatiquement après création du colis via POST /api/shipments.",
+        },
+        { status: 400 }
+      )
+    }
+
+    const extraData: Record<string, unknown> = {}
+    if (newStatus === OrderStatus.REJECTED && reason) extraData.rejectedReason = reason
+    if (newStatus === OrderStatus.CANCELLED && reason) extraData.cancelledReason = reason
+
+    const updated = await prisma.$transaction(async (tx) => {
+      if (Object.keys(extraData).length > 0) {
+        await tx.order.update({ where: { id }, data: extraData })
       }
 
-      const updated = await tx.order.update({
-        where: { id },
-        data: updateData,
-        include: {
-          items: true,
-          supplier: true,
-          reseller: true,
-          shipments: true,
-          commission: true,
-        }
+      return applyOrderTransition({
+        orderId: id,
+        to: newStatus,
+        actorId: session.user.id,
+        actorRole: userRole,
+        notes: notes ?? reason,
+        tx,
       })
-
-      // Create status history
-      await tx.orderStatusHistory.create({
-        data: {
-          orderId: id,
-          fromStatus: order.status,
-          toStatus: newStatus,
-          actorId: userId,
-          actorRole: userRole,
-          notes,
-        }
-      })
-
-      // Handle shipment creation
-      if (newStatus === OrderStatus.SHIPMENT_CREATED && trackingCode) {
-        const idempotencyKey = generateIdempotencyKey(`ship_${id}`)
-
-        const pickupAddress = order.pickupAddress
-          ? {
-              name: order.pickupAddress.name,
-              contactName: order.pickupAddress.contactName,
-              phone: order.pickupAddress.phone,
-              address: order.pickupAddress.address,
-              city: order.pickupAddress.city,
-              postalCode: order.pickupAddress.postalCode,
-            }
-          : Prisma.JsonNull
-
-        await tx.shipment.create({
-          data: {
-            orderId: id,
-            trackingCode,
-            externalId,
-            labelUrl,
-            status: 'CREATED',
-            carrier: 'AMEEX',
-            pieces: 1,
-            idempotencyKey,
-            pickupAddress,
-            deliveryAddress: {
-              name: order.customerName,
-              phone: order.customerPhone,
-              address: order.customerAddress,
-              city: order.customerCity,
-              postalCode: order.customerPostalCode,
-            },
-            codAmount: order.codAmount,
-          }
-        })
-
-        // Update COD collection with tracking code
-        await tx.codCollection.update({
-          where: { orderId: id },
-          data: {
-            shipmentId: (await tx.shipment.findFirst({ where: { orderId: id } }))?.id,
-          }
-        })
-      }
-
-      // Handle delivery - update COD collection
-      if (newStatus === OrderStatus.DELIVERED) {
-        await tx.codCollection.update({
-          where: { orderId: id },
-          data: {
-            status: 'COLLECTED',
-            collectedAt: now,
-          }
-        })
-      }
-
-      return updated
     })
 
-    return NextResponse.json(updatedOrder)
+    const fresh = await prisma.order.findUnique({
+      where: { id },
+      include: {
+        items: true,
+        supplier: { select: { id: true, companyName: true } },
+        reseller: { select: { id: true, companyName: true } },
+        shipments: true,
+        commission: true,
+      },
+    })
+
+    return NextResponse.json({ order: fresh, transition: updated })
   } catch (error) {
-    console.error('Update order status error:', error)
-    return NextResponse.json(
-      { error: 'Erreur lors de la mise à jour du statut' },
-      { status: 500 }
-    )
+    if (error instanceof OrderTransitionError) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode })
+    }
+    console.error('[Update order status] Error:', error)
+    return NextResponse.json({ error: 'Erreur lors de la mise à jour du statut' }, { status: 500 })
   }
 }
 
-export async function GET(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
+/**
+ * GET /api/orders/[id] — détail complet d'une commande.
+ * Les données client ne sont visibles que par l'administrateur, le fournisseur
+ * concerné et le revendeur concerné (§9 « accès limité aux données
+ * personnelles nécessaires à la livraison »).
+ */
+export async function GET(request: Request, { params }: RouteContext) {
   try {
     const session = await auth()
-    const { id } = await params
-    
     if (!session?.user) {
       return NextResponse.json({ error: 'Non autorisé' }, { status: 401 })
     }
 
+    const { id } = await params
     const order = await prisma.order.findUnique({
       where: { id },
       include: {
-        items: {
-          include: {
-            product: true,
-            variant: true
-          }
-        },
-        supplier: {
-          include: { user: { select: { email: true } } }
-        },
-        reseller: {
-          include: { user: { select: { email: true } } }
-        },
-        pickupAddress: true,
-        shipments: {
-          include: { apiLogs: true }
-        },
+        items: { include: { product: true, variant: true } },
+        supplier: { include: { user: { select: { email: true } } } },
+        reseller: { include: { user: { select: { email: true } } } },
+        pickupAddress: { include: { ameexCity: true } },
+        deliveryCity: true,
+        shipments: true,
         commission: true,
         codCollection: true,
-        statusHistory: {
-          orderBy: { createdAt: 'desc' }
-        }
-      }
+        statusHistory: { orderBy: { createdAt: 'desc' } },
+      },
     })
 
     if (!order) {
       return NextResponse.json({ error: 'Commande introuvable' }, { status: 404 })
     }
 
-    // Authorization
     const userRole = session.user.role
     if (userRole === 'SUPPLIER' && order.supplierId !== session.user.supplierProfile?.id) {
       return NextResponse.json({ error: 'Accès refusé' }, { status: 403 })
@@ -293,10 +181,7 @@ export async function GET(
 
     return NextResponse.json(order)
   } catch (error) {
-    console.error('Get order error:', error)
-    return NextResponse.json(
-      { error: 'Erreur lors de la récupération de la commande' },
-      { status: 500 }
-    )
+    console.error('[Get order] Error:', error)
+    return NextResponse.json({ error: 'Erreur lors de la récupération de la commande' }, { status: 500 })
   }
 }

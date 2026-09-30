@@ -25,8 +25,10 @@ import {
   PaginationNext,
   PaginationPrevious,
 } from '@/components/ui'
-import { Search, Loader2, AlertTriangle, ShoppingBag, X, Eye } from 'lucide-react'
+import { Search, Loader2, AlertTriangle, ShoppingBag, X, Eye, Download, Package } from 'lucide-react'
 import { formatCurrency } from '@/lib/utils/helpers'
+import { VALID_TRANSITIONS } from '@/lib/orders/status'
+import { OrderStatusBadge } from '@/components/status-badge'
 
 type OrderStatus =
   | 'PENDING'
@@ -110,20 +112,16 @@ const STATUS_STYLES: Record<OrderStatus, string> = {
 }
 
 /** Statuses an administrator may set manually from this screen. */
-const ADMIN_TRANSITIONS: Record<string, OrderStatus[]> = {
-  PENDING: ['ACCEPTED', 'REJECTED', 'CANCELLED'],
-  ACCEPTED: ['IN_PRODUCTION', 'REJECTED', 'CANCELLED'],
-  IN_PRODUCTION: ['READY_TO_SHIP', 'CANCELLED'],
-  READY_TO_SHIP: ['SHIPMENT_CREATED', 'CANCELLED'],
-  SHIPMENT_CREATED: ['IN_TRANSIT', 'CANCELLED', 'SHIPMENT_ERROR'],
-  IN_TRANSIT: ['DELIVERED', 'DELIVERY_FAILED', 'RETURNED'],
-  DELIVERED: ['RETURNED'],
-  DELIVERY_FAILED: ['RETURNED', 'IN_TRANSIT'],
-  SHIPMENT_ERROR: ['READY_TO_SHIP', 'CANCELLED'],
-  REJECTED: [],
-  CANCELLED: [],
-  RETURNED: [],
-}
+// La matrice vit dans `lib/orders/status` : la dupliquer ici risquerait de
+// diverger de celle que le serveur applique réellement.
+const ADMIN_TRANSITIONS = VALID_TRANSITIONS
+
+/**
+ * « Expédition créée » est posé par POST /api/shipments après l'appel AMEEX (ou
+ * par une saisie manuelle), jamais à la main depuis cet écran : proposer ce
+ * statut ici produirait une commande « expédiée » sans Code Suivi.
+ */
+const MANUAL_ONLY_STATUSES: string[] = ['SHIPMENT_CREATED']
 
 function formatDate(value: string): string {
   return new Date(value).toLocaleDateString('fr-MA', {
@@ -151,6 +149,10 @@ export default function AdminOrdersPage() {
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [nextStatus, setNextStatus] = useState<OrderStatus | ''>('')
   const [statusNotes, setStatusNotes] = useState('')
+  const [manualTrackingCode, setManualTrackingCode] = useState('')
+  const [manualCarrier, setManualCarrier] = useState('AMEEX')
+  const [manualLabelUrl, setManualLabelUrl] = useState('')
+  const [manualNotes, setManualNotes] = useState('')
   const [updating, setUpdating] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
 
@@ -222,6 +224,10 @@ export default function AdminOrdersPage() {
     setIsModalOpen(false)
     setSelectedOrder(null)
     setFormError(null)
+    setManualTrackingCode('')
+    setManualCarrier('AMEEX')
+    setManualLabelUrl('')
+    setManualNotes('')
   }
 
   async function handleStatusUpdate() {
@@ -251,17 +257,71 @@ export default function AdminOrdersPage() {
     }
   }
 
+  /**
+   * Repli manuel de l'intégration (§6.5) : quand l'API AMEEX est indisponible,
+   * l'administrateur enregistre lui-même le transporteur et le Code Suivi.
+   */
+  async function handleManualShipment() {
+    if (!selectedOrder || !manualTrackingCode.trim()) return
+
+    setUpdating(true)
+    setFormError(null)
+    try {
+      const response = await fetch('/api/shipments', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          orderId: selectedOrder.id,
+          trackingCode: manualTrackingCode.trim(),
+          carrier: manualCarrier.trim() || 'AMEEX',
+          labelUrl: manualLabelUrl.trim(),
+          notes: manualNotes.trim(),
+        }),
+      })
+
+      const data = await response.json().catch(() => ({}))
+
+      if (!response.ok) {
+        throw new Error(data.error || "Erreur lors de l'enregistrement de l'expédition")
+      }
+
+      setManualTrackingCode('')
+      setManualCarrier('AMEEX')
+      setManualLabelUrl('')
+      setManualNotes('')
+      await fetchOrders()
+      closeModal()
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "Erreur lors de l'enregistrement")
+    } finally {
+      setUpdating(false)
+    }
+  }
+
   const availableTransitions = selectedOrder
-    ? ADMIN_TRANSITIONS[selectedOrder.status] || []
+    ? (ADMIN_TRANSITIONS[selectedOrder.status] || []).filter(
+        (status) => !MANUAL_ONLY_STATUSES.includes(status)
+      )
     : []
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-gray-900">Gestion des commandes</h1>
-        <p className="text-gray-500">
-          {total} commande{total > 1 ? 's' : ''} sur la plateforme
-        </p>
+      <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Gestion des commandes</h1>
+          <p className="text-gray-500">
+            {total} commande{total > 1 ? 's' : ''} sur la plateforme
+          </p>
+        </div>
+        <Button
+          variant="outline"
+          onClick={() => {
+            window.location.href = '/api/admin/export?dataset=orders'
+          }}
+        >
+          <Download className="h-4 w-4 mr-2" />
+          Exporter en CSV
+        </Button>
       </div>
 
       {/* Filters */}
@@ -646,6 +706,70 @@ export default function AdminOrdersPage() {
                   </div>
                 </div>
               )}
+            </div>
+
+            {/* Repli manuel de l'intégration (§6.5) */}
+            <div className="mt-6 pt-4 border-t border-gray-200">
+              <h3 className="font-semibold text-gray-900 mb-1">Expédition</h3>
+              <p className="text-xs text-gray-500 mb-3">
+                Le statut « Expédition créée » est positionné automatiquement après l&apos;appel à
+                AMEEX. Si l&apos;API est indisponible, saisissez le Code Suivi manuellement : il est
+                enregistré tel quel et n&apos;est jamais rattaché à une autre commande.
+              </p>
+
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="grid gap-2">
+                  <Label htmlFor="manualTrackingCode">Code Suivi</Label>
+                  <Input
+                    id="manualTrackingCode"
+                    value={manualTrackingCode}
+                    onChange={(e) => setManualTrackingCode(e.target.value)}
+                    placeholder="Code renvoyé par le transporteur"
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="manualCarrier">Transporteur</Label>
+                  <Input
+                    id="manualCarrier"
+                    value={manualCarrier}
+                    onChange={(e) => setManualCarrier(e.target.value)}
+                    placeholder="AMEEX"
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="manualLabelUrl">URL d&apos;étiquette (optionnel)</Label>
+                  <Input
+                    id="manualLabelUrl"
+                    value={manualLabelUrl}
+                    onChange={(e) => setManualLabelUrl(e.target.value)}
+                    placeholder="https://..."
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="manualNotes">Motif de la saisie manuelle</Label>
+                  <Input
+                    id="manualNotes"
+                    value={manualNotes}
+                    onChange={(e) => setManualNotes(e.target.value)}
+                    placeholder="API AMEEX indisponible"
+                  />
+                </div>
+
+                <div className="sm:col-span-2 flex justify-end">
+                  <Button
+                    variant="outline"
+                    onClick={handleManualShipment}
+                    disabled={updating || !manualTrackingCode.trim()}
+                  >
+                    {updating ? (
+                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    ) : (
+                      <Package className="h-4 w-4 mr-2" />
+                    )}
+                    Enregistrer l&apos;expédition
+                  </Button>
+                </div>
+              </div>
             </div>
           </div>
         </div>

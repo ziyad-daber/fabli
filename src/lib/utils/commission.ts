@@ -1,5 +1,23 @@
+/**
+ * Calcul des prix, commissions et marges (§5.6).
+ *
+ * Définition retenue, alignée sur l'exemple du cahier des charges :
+ *   prix fournisseur 100, prix revendeur 180, livraison 30
+ *   commission = 10 % du prix fournisseur = 10
+ *   marge brute du revendeur = prix revendeur − prix fournisseur = 80
+ *   total client = prix revendeur + livraison = 210
+ *
+ * La marge brute est donc calculée **avant** commission plateforme : c'est ce
+ * que le cahier des charges appelle « marge brute estimée ». La marge nette,
+ * ce qui reste réellement au revendeur après la commission, est exposée à
+ * part pour éviter toute ambiguïté dans les écrans.
+ *
+ * Commission = prix fournisseur × taux. Elle porte donc sur le prix de gros,
+ * pas sur le prix de vente.
+ */
+
 export interface CommissionCalculation {
-  commissionRate: number // e.g., 0.10 for 10%
+  commissionRate: number // ex. 0.10 pour 10 %
   supplierPrice: number
   resellerPrice: number
   shippingFee: number
@@ -8,7 +26,10 @@ export interface CommissionCalculation {
 
 export interface CommissionResult {
   commissionAmount: number
+  /** Marge brute du revendeur : revente − prix fournisseur. */
   resellerMargin: number
+  /** Marge restant au revendeur après commission plateforme. */
+  netResellerMargin: number
   resellerMarginPercent: number
   clientTotal: number
   breakdown: {
@@ -17,28 +38,25 @@ export interface CommissionResult {
     shippingFee: number
     commissionRate: number
     commissionAmount: number
+    resellerMargin: number
+    netResellerMargin: number
   }
 }
 
-/**
- * Calculate commission based on platform settings
- * Formula: Commission = Supplier Price × Commission Rate
- * Reseller Margin = Reseller Price - Supplier Price - Commission
- * Client Total = Reseller Price + Shipping Fee
- */
 export function calculateCommission(params: CommissionCalculation): CommissionResult {
-  const { commissionRate, supplierPrice, resellerPrice, shippingFee, currency } = params
-  
-  const commissionAmount = Number((supplierPrice * commissionRate).toFixed(2))
-  const resellerMargin = Number((resellerPrice - supplierPrice - commissionAmount).toFixed(2))
-  const resellerMarginPercent = resellerPrice > 0 
-    ? Number(((resellerMargin / resellerPrice) * 100).toFixed(1))
-    : 0
-  const clientTotal = Number((resellerPrice + shippingFee).toFixed(2))
+  const { commissionRate, supplierPrice, resellerPrice, shippingFee } = params
+
+  const commissionAmount = round2(supplierPrice * commissionRate)
+  const resellerMargin = round2(resellerPrice - supplierPrice)
+  const netResellerMargin = round2(resellerMargin - commissionAmount)
+  const resellerMarginPercent =
+    resellerPrice > 0 ? round2((resellerMargin / resellerPrice) * 100) : 0
+  const clientTotal = round2(resellerPrice + shippingFee)
 
   return {
     commissionAmount,
     resellerMargin,
+    netResellerMargin,
     resellerMarginPercent,
     clientTotal,
     breakdown: {
@@ -47,13 +65,12 @@ export function calculateCommission(params: CommissionCalculation): CommissionRe
       shippingFee,
       commissionRate,
       commissionAmount,
-    }
+      resellerMargin,
+      netResellerMargin,
+    },
   }
 }
 
-/**
- * Calculate commission for order items (multiple products)
- */
 export interface OrderItemCalculation {
   productId: string
   variantId?: string
@@ -62,52 +79,74 @@ export interface OrderItemCalculation {
   resellerPrice: number
 }
 
+export interface CalculatedOrderItem extends OrderItemCalculation {
+  totalSupplierPrice: number
+  totalResellerPrice: number
+  totalCommission: number
+  totalGrossMargin: number
+}
+
 export interface OrderCommissionResult {
-  items: Array<OrderItemCalculation & { 
-    totalSupplierPrice: number
-    totalResellerPrice: number
-    totalCommission: number
-  }>
+  items: CalculatedOrderItem[]
+  /** Somme des prix de revente : c'est le montant que le client règle, hors livraison. */
   subtotal: number
   totalCommission: number
   totalSupplierPrice: number
   totalResellerPrice: number
+  totalGrossMargin: number
+  totalNetMargin: number
 }
 
 export function calculateOrderCommission(
   items: OrderItemCalculation[],
   commissionRate: number
 ): OrderCommissionResult {
-  const calculatedItems = items.map(item => {
-    const totalSupplierPrice = Number((item.supplierPrice * item.quantity).toFixed(2))
-    const totalResellerPrice = Number((item.resellerPrice * item.quantity).toFixed(2))
-    const totalCommission = Number((totalSupplierPrice * commissionRate).toFixed(2))
-    
+  const calculatedItems: CalculatedOrderItem[] = items.map((item) => {
+    const totalSupplierPrice = round2(item.supplierPrice * item.quantity)
+    const totalResellerPrice = round2(item.resellerPrice * item.quantity)
+    const totalCommission = round2(totalSupplierPrice * commissionRate)
+
     return {
       ...item,
       totalSupplierPrice,
       totalResellerPrice,
       totalCommission,
+      totalGrossMargin: round2(totalResellerPrice - totalSupplierPrice),
     }
   })
 
-  const subtotal = Number(calculatedItems.reduce((sum, item) => sum + item.totalResellerPrice, 0).toFixed(2))
-  const totalCommission = Number(calculatedItems.reduce((sum, item) => sum + item.totalCommission, 0).toFixed(2))
-  const totalSupplierPrice = Number(calculatedItems.reduce((sum, item) => sum + item.totalSupplierPrice, 0).toFixed(2))
-  const totalResellerPrice = Number(calculatedItems.reduce((sum, item) => sum + item.totalResellerPrice, 0).toFixed(2))
+  const totalSupplierPrice = sum(calculatedItems.map((i) => i.totalSupplierPrice))
+  const totalResellerPrice = sum(calculatedItems.map((i) => i.totalResellerPrice))
+  const totalCommission = sum(calculatedItems.map((i) => i.totalCommission))
+  const totalGrossMargin = round2(totalResellerPrice - totalSupplierPrice)
 
   return {
     items: calculatedItems,
-    subtotal,
+    subtotal: totalResellerPrice,
     totalCommission,
     totalSupplierPrice,
     totalResellerPrice,
+    totalGrossMargin,
+    totalNetMargin: round2(totalGrossMargin - totalCommission),
   }
 }
 
 /**
- * Format currency for display
+ * Taux de commission effectif de la plateforme, en pourcentage.
+ * La valeur stockée est une fraction (0.10 = 10 %).
  */
+export function getCommissionRate(): Promise<number> {
+  return import('@/lib/db/prisma').then(async ({ prisma }) => {
+    const setting = await prisma.platformSetting.findUnique({
+      where: { key: 'commission_rate' },
+    })
+    const parsed = setting ? Number(setting.value) : DEFAULT_COMMISSION_RATE
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_COMMISSION_RATE
+  })
+}
+
+export const DEFAULT_COMMISSION_RATE = 0.1
+
 export function formatCurrency(amount: number, currency = 'MAD'): string {
   return new Intl.NumberFormat('fr-MA', {
     style: 'currency',
@@ -117,18 +156,24 @@ export function formatCurrency(amount: number, currency = 'MAD'): string {
   }).format(amount)
 }
 
-/**
- * Parse decimal string to number safely
- */
 export function parseDecimal(value: string | number): number {
   if (typeof value === 'number') return value
   const parsed = parseFloat(value)
-  return isNaN(parsed) ? 0 : parsed
+  return Number.isNaN(parsed) ? 0 : parsed
 }
 
 /**
- * Round to 2 decimal places
+ * Arrondi à deux décimales, stable sur les montants.
+ *
+ * `Math.round(1.005 * 100)` vaut 100 en IEEE-754, car 1.005 * 100 vaut
+ * 100.49999999999999. Passer par la notation exponentielle impose un
+ * arrondi décimal correct avant le Math.round.
  */
 export function round2(value: number): number {
-  return Math.round(value * 100) / 100
+  if (!Number.isFinite(value)) return 0
+  return Math.round(Number(`${value}e2`)) / 100
+}
+
+function sum(values: number[]): number {
+  return round2(values.reduce((acc, value) => acc + value, 0))
 }

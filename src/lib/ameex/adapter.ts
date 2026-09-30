@@ -1,87 +1,83 @@
-import { prisma } from '@/lib/db/prisma'
 import { createHmac } from 'crypto'
-import type { OrderStatus, ShipmentStatus } from '@prisma/client'
+import type { OrderStatus, Prisma, ShipmentStatus } from '@prisma/client'
+import { prisma } from '@/lib/db/prisma'
+import { resolveAmeexCredentials } from '@/lib/ameex/credentials'
 
-const AMEEX_BASE_URL = 'https://api.ameex.app'
+const DEFAULT_BASE_URL = process.env.AMEEX_BASE_URL || 'https://api.ameex.app'
+const REQUEST_TIMEOUT_MS = Number(process.env.AMEEX_TIMEOUT_MS || 15000)
+const MAX_ATTEMPTS = Number(process.env.AMEEX_MAX_ATTEMPTS || 2)
 
 /**
- * Constant-time string comparison. Both inputs must already be the same
- * length; the loop accumulates differences so no early exit leaks position.
+ * Client AMEEX.
+ *
+ * Invariants tenues ici (§6.5 du cahier des charges) :
+ *  - délai d'attente maximal sur chaque appel (`AbortSignal.timeout`) ;
+ *  - réessais contrôlés, uniquement sur erreurs réseau / 5xx / 429 ;
+ *  - journalisation de chaque appel dans `CourierApiLog`, sans secret ni
+ *    donnée personnelle inutile ;
+ *  - les identifiants ne sont lus que côté serveur et ne sortent jamais d'ici.
  */
+
+/** Champs de la requête qui ne sont jamais journalisés tels quels. */
+const REDACTED_FIELDS = new Set(['phone', 'sender_phone', 'address', 'sender_address', 'cod', 'receiver'])
+
+function redactForLog(payload: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(payload)) {
+    out[key] = REDACTED_FIELDS.has(key) ? '[REDACTED]' : value
+  }
+  return out
+}
+
 function timingSafeEqualHex(a: string, b: string): boolean {
   if (a.length !== b.length) return false
-
   let diff = 0
   for (let i = 0; i < a.length; i++) {
     diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
   }
-
   return diff === 0
 }
 
-interface AmexCredentials {
-  apiKey: string
-  accountId: string
-  baseUrl?: string
-}
-
-async function getCredentials(): Promise<AmexCredentials> {
-  const integration = await prisma.courierIntegration.findFirst({
-    where: { name: 'AMEEX' },
-  })
-  if (!integration || !integration.apiKey || !integration.accountId) {
-    throw new Error('AMEEX credentials not configured')
-  }
-  return {
-    apiKey: integration.apiKey,
-    accountId: integration.accountId,
-    baseUrl: integration.baseUrl || AMEEX_BASE_URL,
-  }
-}
-
-function getHeaders(creds: AmexCredentials) {
-  return {
-    'C-Api-Id': creds.apiKey,
-    'C-Api-Key': creds.accountId,
-  }
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 export interface ShipmentRequest {
+  /** Référence interne de commande (§6.3). */
   orderReference: string
   recipient: {
     name: string
+    /** Identifiant de ville AMEEX, pas un nom libre. */
+    cityId: string
+    cityLabel?: string
     phone: string
-    email?: string
     address: string
-    city: string
     postalCode?: string
   }
   pickup?: {
     name: string
     phone: string
     address: string
-    city: string
+    cityId: string
+    cityLabel?: string
     postalCode?: string
     contactName?: string
   }
   pieces: number
-  weight: number // in kg
-  length?: number // in cm
-  width?: number // in cm
-  height?: number // in cm
+  /** Poids total en kg. */
+  weight: number
+  length?: number
+  width?: number
+  height?: number
+  /** Montant COD à encaisser (§6.3). */
   codAmount?: number
   currency?: string
   instructions?: string
+  /** Clé d'idempotence serveur, transmise comme `exchange_code`. */
   idempotencyKey: string
   product?: string
-  orderNum?: string
   comment?: string
-  exchangeCode?: string
-  // Additional fields for products array
-  productItems?: Array<{
-    id?: string
-    qty: number
-  }>
+  productItems?: Array<{ id?: string; qty: number }>
 }
 
 export interface ShipmentResponse {
@@ -92,10 +88,10 @@ export interface ShipmentResponse {
   status?: string
   error?: string
   rawResponse?: unknown
-  // Additional fields from AMEEX response
   exchangeCode?: string
   price?: number
   deliveryTime?: string
+  attempts?: number
 }
 
 export interface TrackingEvent {
@@ -116,428 +112,473 @@ export interface TrackingResponse {
   error?: string
 }
 
-export interface ParcelInfoResponse {
-  success: boolean
-  data?: any
-  error?: string
+export interface ApiCallLog {
+  integrationId: string
+  shipmentId?: string | null
+  method: string
+  endpoint: string
+  requestBody?: Prisma.InputJsonValue
+  responseBody?: Prisma.InputJsonValue
+  statusCode?: number | null
+  errorMessage?: string | null
+  durationMs: number
+}
+
+interface RequestOptions {
+  method: 'GET' | 'POST' | 'DELETE'
+  path: string
+  query?: Record<string, string | number | undefined>
+  form?: URLSearchParams
+  /** Les appels non idempotents ne sont pas réessayés. */
+  retry?: boolean
+  shipmentId?: string | null
 }
 
 export class AmexAdapter {
-  private creds: AmexCredentials
+  private integrationId: string
+  private apiId: string
+  private apiKey: string
+  private accountId: string
   private baseUrl: string
 
-  constructor(creds: AmexCredentials) {
-    this.creds = creds
-    this.baseUrl = creds.baseUrl || AMEEX_BASE_URL
+  private constructor(params: {
+    integrationId: string
+    apiId: string
+    apiKey: string
+    accountId: string
+    baseUrl: string
+  }) {
+    this.integrationId = params.integrationId
+    this.apiId = params.apiId
+    this.apiKey = params.apiKey
+    this.accountId = params.accountId
+    this.baseUrl = params.baseUrl || DEFAULT_BASE_URL
+  }
+
+  static async create(): Promise<AmexAdapter> {
+    const creds = await resolveAmeexCredentials()
+    if (!creds) {
+      throw new Error('Intégration AMEEX non configurée. Renseignez-la depuis /dashboard/admin/ameex.')
+    }
+    if (!creds.apiKey || !creds.accountId) {
+      throw new Error('Identifiants AMEEX incomplets (apiKey / accountId manquants).')
+    }
+    const integration = await prisma.courierIntegration.findFirst({
+      where: { name: 'AMEEX' },
+      select: { id: true },
+    })
+    return new AmexAdapter({
+      integrationId: integration?.id ?? '',
+      // AMEEX attend l'identifiant d'API dans C-Api-Id et la clé dans C-Api-Key.
+      apiId: creds.apiKey,
+      apiKey: creds.apiSecret || creds.apiKey,
+      accountId: creds.accountId,
+      baseUrl: creds.baseUrl,
+    })
+  }
+
+  get isConfigured(): boolean {
+    return this.integrationId.length > 0
+  }
+
+  private async log(entry: ApiCallLog): Promise<void> {
+    if (!this.integrationId) return
+    try {
+      await prisma.courierApiLog.create({
+        data: {
+          integrationId: this.integrationId,
+          shipmentId: entry.shipmentId ?? null,
+          method: entry.method,
+          endpoint: entry.endpoint,
+          requestBody: entry.requestBody,
+          responseBody: entry.responseBody,
+          statusCode: entry.statusCode ?? null,
+          errorMessage: entry.errorMessage ?? null,
+          durationMs: entry.durationMs,
+        },
+      })
+    } catch (error) {
+      // La journalisation ne doit jamais faire échouer l'appel métier.
+      console.error('[AMEEX] journalisation impossible', error)
+    }
   }
 
   /**
-   * Create a new shipment via AMEEX API
-   * Endpoint: POST /customer/Delivery/Parcels/Action/Type/Add
+   * Appel HTTP unifié : timeout, réessais, journalisation.
+   */
+  private async request<T = any>(options: RequestOptions): Promise<{
+    ok: boolean
+    status: number
+    data: T | null
+    error?: string
+    attempts: number
+  }> {
+    const url = new URL(`${this.baseUrl}${options.path}`)
+    for (const [key, value] of Object.entries(options.query ?? {})) {
+      if (value !== undefined && value !== null && value !== '') url.searchParams.set(key, String(value))
+    }
+
+    const payload = options.form ? redactForLog(Object.fromEntries(options.form)) : undefined
+    const canRetry = options.retry !== false
+    let attempt = 0
+    let lastError = ''
+    let lastStatus = 0
+
+    while (attempt < Math.max(1, MAX_ATTEMPTS)) {
+      attempt += 1
+      const startedAt = Date.now()
+      let responseBody: unknown = null
+      let networkError: string | null = null
+
+      try {
+        const res = await fetch(url.toString(), {
+          method: options.method,
+          headers: {
+            'C-Api-Id': this.apiId,
+            'C-Api-Key': this.apiKey,
+            ...(options.form ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}),
+          },
+          body: options.form ? options.form.toString() : undefined,
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          cache: 'no-store',
+        })
+
+        lastStatus = res.status
+        const text = await res.text()
+        if (text) {
+          try {
+            responseBody = JSON.parse(text)
+          } catch {
+            responseBody = { raw: text.slice(0, 2000) }
+          }
+        }
+
+        await this.log({
+          integrationId: this.integrationId,
+          shipmentId: options.shipmentId ?? null,
+          method: options.method,
+          endpoint: options.path,
+          requestBody: payload as Prisma.InputJsonValue | undefined,
+          responseBody: responseBody as Prisma.InputJsonValue | undefined,
+          statusCode: res.status,
+          durationMs: Date.now() - startedAt,
+        })
+
+        const retryable = res.status >= 500 || res.status === 429
+        if (!retryable) {
+          return {
+            ok: res.ok,
+            status: res.status,
+            data: responseBody as T | null,
+            error: res.ok ? undefined : extractError(responseBody, res.status),
+            attempts: attempt,
+          }
+        }
+        lastError = extractError(responseBody, res.status)
+      } catch (error) {
+        networkError = error instanceof Error ? error.message : 'Erreur réseau'
+        lastStatus = 0
+        lastError = networkError
+
+        await this.log({
+          integrationId: this.integrationId,
+          shipmentId: options.shipmentId ?? null,
+          method: options.method,
+          endpoint: options.path,
+          requestBody: payload as Prisma.InputJsonValue | undefined,
+          errorMessage: networkError,
+          durationMs: Date.now() - startedAt,
+        })
+      }
+
+      if (!canRetry || attempt >= MAX_ATTEMPTS) break
+      // Backoff exponentiel court : le but est d'absorber un 429/5xx passager,
+      // pas de masquer une panne durable.
+      await sleep(400 * 2 ** (attempt - 1))
+    }
+
+    return { ok: false, status: lastStatus, data: null, error: lastError, attempts: attempt }
+  }
+
+  /**
+   * Crée une expédition (§6.2 étape 3-4).
+   * POST /customer/Delivery/Parcels/Action/Type/Add
+   *
+   * L'idempotence est portée par `exchange_code` : la même clé renvoie le même
+   * colis côté AMEEX, donc un réessai après timeout ne duplique pas l'envoi.
    */
   async createShipment(request: ShipmentRequest): Promise<ShipmentResponse> {
-    const form = new URLSearchParams()
+    if (!request.recipient?.phone) {
+      return { success: false, error: 'Téléphone du destinataire manquant' }
+    }
+    if (!request.recipient?.cityId) {
+      return {
+        success: false,
+        error: "La ville du destinataire n'est pas rattachée à un identifiant AMEEX. Demandez à l'administrateur de l'associer dans Paramètres → Villes.",
+      }
+    }
 
-    // Required fields
+    const form = new URLSearchParams()
     form.append('type', 'SIMPLE')
-    form.append('business', this.creds.accountId)
+    form.append('business', this.accountId)
+    form.append('exchange_code', request.idempotencyKey)
+    form.append('order_num', request.orderReference)
     form.append('receiver', request.recipient.name)
     form.append('phone', request.recipient.phone)
-    form.append('city', String(request.recipient.city))
+    form.append('city', request.recipient.cityId)
     form.append('address', request.recipient.address)
+    if (request.recipient.postalCode) form.append('postalcode', request.recipient.postalCode)
 
-    // Optional fields
-    if (request.orderReference) form.append('order_num', request.orderReference)
-    if (request.orderNum) form.append('order_num', request.orderNum) // Override if provided
-    if (request.exchangeCode) form.append('exchange_code', request.exchangeCode)
-    if (request.comment) form.append('comment', request.comment)
-    if (request.product) form.append('product', request.product)
-    if (request.codAmount !== undefined) form.append('cod', String(request.codAmount))
-
-    // Pickup information (if provided)
     if (request.pickup) {
       form.append('sender_name', request.pickup.name)
       form.append('sender_phone', request.pickup.phone)
       form.append('sender_address', request.pickup.address)
-      form.append('sender_city', request.pickup.city)
+      form.append('sender_city', request.pickup.cityId)
       if (request.pickup.postalCode) form.append('sender_postalcode', request.pickup.postalCode)
       if (request.pickup.contactName) form.append('sender_contact', request.pickup.contactName)
     }
 
-    // Package details
     form.append('number_of_parcels', String(request.pieces))
-    if (request.weight !== undefined) form.append('weight', String(request.weight))
-    if (request.length !== undefined) form.append('length', String(request.length))
-    if (request.width !== undefined) form.append('width', String(request.width))
-    if (request.height !== undefined) form.append('height', String(request.height))
+    form.append('weight', String(request.weight))
+    if (request.length) form.append('length', String(request.length))
+    if (request.width) form.append('width', String(request.width))
+    if (request.height) form.append('height', String(request.height))
 
-    // Additional options
     form.append('open', 'YES')
     form.append('try', 'YES')
-    form.append('fragile', '0') // 0 = not fragile, 1 = fragile
+    form.append('fragile', '0')
 
-    // Products array (if provided)
-    if (request.productItems && request.productItems.length > 0) {
-      request.productItems.forEach((item, index) => {
-        if (item.id) form.append(`products[${index}][id]`, item.id)
-        if (item.qty) form.append(`products[${index}][qty]`, String(item.qty))
-      })
-    }
-
-    try {
-      const res = await fetch(`${this.baseUrl}/customer/Delivery/Parcels/Action/Type/Add`, {
-        method: 'POST',
-        headers: {
-          ...getHeaders(this.creds),
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: form.toString(),
-      })
-
-      const data = await res.json().catch(() => null)
-
-      if (res.status === 200 && data) {
-        return {
-          success: true,
-          shipmentId: data.parcel_code || data.ParcelCode,
-          trackingCode: data.parcel_code || data.ParcelCode,
-          labelUrl: data.label_url || data.labelUrl,
-          status: data.status || 'CREATED',
-          exchangeCode: data.exchange_code || data.ExchangeCode,
-          price: data.price || data.cod,
-          deliveryTime: data.delivery_time || data.deliveryTime,
-          rawResponse: data,
-        }
-      }
-
-      return {
-        success: false,
-        error: data?.message || `HTTP ${res.status}: ${res.statusText}`,
-        rawResponse: data,
-      }
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to create shipment',
-      }
-    }
-  }
-
-  /**
-   * Edit an existing shipment
-   * Endpoint: POST /customer/Delivery/Parcels/Action/Type/Edit
-   */
-  async editShipment(parcelCode: string, request: Partial<ShipmentRequest>): Promise<ShipmentResponse> {
-    const form = new URLSearchParams()
-    form.append('exchange_code', request.exchangeCode || '')
-
-    // Only include fields that are provided
-    if (request.recipient?.name) form.append('receiver', request.recipient.name)
-    if (request.recipient?.phone) form.append('phone', request.recipient.phone)
-    if (request.recipient?.city) form.append('city', String(request.recipient.city))
-    if (request.recipient?.address) form.append('address', request.recipient.address)
-    if (request.recipient?.postalCode) form.append('postalcode', request.recipient.postalCode)
-
-    if (request.orderNum) form.append('order_num', request.orderNum)
-    if (request.comment) form.append('comment', request.comment)
     if (request.product) form.append('product', request.product)
-    if (request.codAmount !== undefined) form.append('cod', String(request.codAmount))
+    if (request.comment) form.append('comment', request.comment)
+    // AMEEX attend le montant à encaisser dans `cod` ; c'est le total que le
+    // client final règle au livreur (§5.7).
+    form.append('cod', String(request.codAmount ?? 0))
 
-    // Pickup information
-    if (request.pickup) {
-      if (request.pickup.name) form.append('sender_name', request.pickup.name)
-      if (request.pickup.phone) form.append('sender_phone', request.pickup.phone)
-      if (request.pickup.address) form.append('sender_address', request.pickup.address)
-      if (request.pickup.city) form.append('sender_city', request.pickup.city)
-      if (request.pickup.postalCode) form.append('sender_postalcode', request.pickup.postalCode)
-      if (request.pickup.contactName) form.append('sender_contact', request.pickup.contactName)
+    request.productItems?.forEach((item, index) => {
+      if (item.id) form.append(`products[${index}][id]`, item.id)
+      if (item.qty) form.append(`products[${index}][qty]`, String(item.qty))
+    })
+
+    const result = await this.request({
+      method: 'POST',
+      path: '/customer/Delivery/Parcels/Action/Type/Add',
+      form,
+      shipmentId: null,
+    })
+
+    if (!result.ok || !result.data) {
+      return { success: false, error: result.error, rawResponse: result.data, attempts: result.attempts }
     }
 
-    try {
-      const res = await fetch(
-        `${this.baseUrl}/customer/Delivery/Parcels/Action/Type/Edit?ParcelCode=${encodeURIComponent(parcelCode)}`,
-        {
-          method: 'POST',
-          headers: {
-            ...getHeaders(this.creds),
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          body: form.toString(),
-        }
-      )
+    const data = result.data
+    const trackingCode = data.parcel_code || data.ParcelCode || data.tracking_code || null
 
-      const data = await res.json().catch(() => null)
-
-      if (res.status === 200 && data) {
-        return {
-          success: true,
-          shipmentId: data.parcel_code || data.ParcelCode,
-          trackingCode: data.parcel_code || data.ParcelCode,
-          labelUrl: data.label_url || data.labelUrl,
-          status: data.status || 'UPDATED',
-          rawResponse: data,
-        }
-      }
-
+    if (!trackingCode) {
       return {
         success: false,
-        error: data?.message || `HTTP ${res.status}: ${res.statusText}`,
+        error: 'Réponse AMEEX sans Code Suivi',
         rawResponse: data,
+        attempts: result.attempts,
       }
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to edit shipment',
-      }
+    }
+
+    return {
+      success: true,
+      shipmentId: trackingCode,
+      trackingCode,
+      labelUrl: data.label_url || data.labelUrl || null,
+      status: data.status || 'CREATED',
+      exchangeCode: data.exchange_code || request.idempotencyKey,
+      price: data.price,
+      deliveryTime: data.delivery_time || data.deliveryTime,
+      rawResponse: data,
+      attempts: result.attempts,
     }
   }
 
   /**
-   * Get shipment tracking information
-   * Endpoint: GET /customer/Delivery/Parcels/Tracking
+   * Met à jour un colis existant.
+   * POST /customer/Delivery/Parcels/Action/Type/Edit
    */
-  async getTracking(trackingCode: string): Promise<TrackingResponse> {
-    try {
-      const res = await fetch(
-        `${this.baseUrl}/customer/Delivery/Parcels/Tracking?ParcelCode=${encodeURIComponent(trackingCode)}`,
-        {
-          method: 'GET',
-          headers: getHeaders(this.creds),
-        }
-      )
+  async editShipment(parcelCode: string, updates: Partial<ShipmentRequest>): Promise<ShipmentResponse> {
+    const form = new URLSearchParams()
+    form.append('exchange_code', updates.idempotencyKey ?? parcelCode)
+    if (updates.orderReference) form.append('order_num', updates.orderReference)
+    if (updates.recipient?.name) form.append('receiver', updates.recipient.name)
+    if (updates.recipient?.phone) form.append('phone', updates.recipient.phone)
+    if (updates.recipient?.cityId) form.append('city', updates.recipient.cityId)
+    if (updates.recipient?.address) form.append('address', updates.recipient.address)
+    if (updates.recipient?.postalCode) form.append('postalcode', updates.recipient.postalCode)
+    if (updates.codAmount !== undefined) form.append('cod', String(updates.codAmount))
+    if (updates.comment) form.append('comment', updates.comment)
+    if (updates.pickup) {
+      if (updates.pickup.name) form.append('sender_name', updates.pickup.name)
+      if (updates.pickup.phone) form.append('sender_phone', updates.pickup.phone)
+      if (updates.pickup.address) form.append('sender_address', updates.pickup.address)
+      if (updates.pickup.cityId) form.append('sender_city', updates.pickup.cityId)
+      if (updates.pickup.postalCode) form.append('sender_postalcode', updates.pickup.postalCode)
+    }
 
-      const data = await res.json().catch(() => null)
+    const result = await this.request({
+      method: 'POST',
+      path: '/customer/Delivery/Parcels/Action/Type/Edit',
+      query: { ParcelCode: parcelCode },
+      form,
+      shipmentId: null,
+    })
 
-      if (res.status === 200 && data) {
-        const events: TrackingEvent[] = Array.isArray(data.history)
-          ? data.history.map((h: any) => ({
-              date: h.date || '',
-              status: h.status || '',
-              location: h.location,
-              description: h.description || h.label || '',
-            }))
-          : []
+    if (!result.ok || !result.data) {
+      return { success: false, error: result.error, rawResponse: result.data }
+    }
 
-        return {
-          success: true,
-          trackingCode,
-          status: data.status || 'UNKNOWN',
-          events,
-          deliveredAt: data.delivered_at || data.deliveredAt,
-          codCollected: data.cod_collected || data.codCollected,
-          price: data.price || data.cod,
-        }
-      }
-
-      return {
-        success: false,
-        trackingCode,
-        status: 'ERROR',
-        error: data?.message || `HTTP ${res.status}`,
-      }
-    } catch (error) {
-      return {
-        success: false,
-        trackingCode: trackingCode,
-        status: 'ERROR',
-        error: error instanceof Error ? error.message : 'Failed to fetch tracking',
-      }
+    return {
+      success: true,
+      trackingCode: result.data.parcel_code || parcelCode,
+      labelUrl: result.data.label_url || result.data.labelUrl || null,
+      status: result.data.status || 'UPDATED',
+      rawResponse: result.data,
+      attempts: result.attempts,
     }
   }
 
   /**
-   * Get parcel info
-   * Endpoint: GET /customer/Delivery/Parcels/Info
+   * Suivi d'un colis (§6.2 étape 6).
+   * GET /customer/Delivery/Parcels/Tracking
    */
-  async getParcelInfo(parcelCode: string): Promise<ParcelInfoResponse> {
-    try {
-      const res = await fetch(
-        `${this.baseUrl}/customer/Delivery/Parcels/Info?ParcelCode=${encodeURIComponent(parcelCode)}`,
-        {
-          method: 'GET',
-          headers: getHeaders(this.creds),
-        }
-      )
+  async getTracking(trackingCode: string, shipmentId?: string | null): Promise<TrackingResponse> {
+    const result = await this.request({
+      method: 'GET',
+      path: '/customer/Delivery/Parcels/Tracking',
+      query: { ParcelCode: trackingCode },
+      shipmentId: shipmentId ?? null,
+    })
 
-      const data = await res.json().catch(() => null)
+    if (!result.ok || !result.data) {
+      return { success: false, trackingCode, status: 'ERROR', error: result.error }
+    }
 
-      if (res.status === 200) {
-        return { success: true, data }
-      }
+    const data = result.data
+    const history: any[] = Array.isArray(data.history)
+      ? data.history
+      : Array.isArray(data.tracking)
+        ? data.tracking
+        : []
 
-      return {
-        success: false,
-        error: data?.message || `HTTP ${res.status}`,
-      }
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to fetch parcel info',
-      }
+    const events: TrackingEvent[] = history.map((h: any) => ({
+      date: h.date || h.datetime || '',
+      status: h.status || h.statut || '',
+      location: h.location || h.city,
+      description: h.description || h.label || h.comment || '',
+    }))
+
+    return {
+      success: true,
+      trackingCode,
+      status: data.status || data.statut || 'UNKNOWN',
+      events,
+      deliveredAt: data.delivered_at || data.deliveredAt || null,
+      codCollected: data.cod_collected ?? data.codCollected ?? null,
+      price: data.price ?? data.cod,
     }
   }
 
   /**
-   * Get parcel status
-   * Endpoint: GET /customer/Delivery/Parcels/Statuts
+   * Détail d'un colis.
+   * GET /customer/Delivery/Parcels/Info
    */
-  async getParcelStatus(): Promise<{ success: boolean; data?: any; error?: string }> {
-    try {
-      const res = await fetch(
-        `${this.baseUrl}/customer/Delivery/Parcels/Statuts`,
-        {
-          method: 'GET',
-          headers: getHeaders(this.creds),
-        }
-      )
-
-      const data = await res.json().catch(() => null)
-
-      if (res.status === 200) {
-        return { success: true, data }
-      }
-
-      return {
-        success: false,
-        error: data?.message || `HTTP ${res.status}`,
-      }
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to fetch parcel statuses',
-      }
-    }
+  async getParcelInfo(parcelCode: string): Promise<{ success: boolean; data?: unknown; error?: string }> {
+    const result = await this.request({
+      method: 'GET',
+      path: '/customer/Delivery/Parcels/Info',
+      query: { ParcelCode: parcelCode },
+    })
+    return result.ok
+      ? { success: true, data: result.data }
+      : { success: false, error: result.error }
   }
 
   /**
-   * Delete a parcel
-   * Endpoint: DELETE /customer/Delivery/Parcels/Action/Type/Delete
+   * Référence des statuts de colis acceptés par AMEEX.
+   * GET /customer/Delivery/Parcels/Statuts
+   */
+  async getParcelStatuses(): Promise<{ success: boolean; data?: unknown; error?: string }> {
+    const result = await this.request({ method: 'GET', path: '/customer/Delivery/Parcels/Statuts' })
+    return result.ok ? { success: true, data: result.data } : { success: false, error: result.error }
+  }
+
+  /**
+   * Supprime un colis.
+   * DELETE /customer/Delivery/Parcels/Action/Type/Delete
    */
   async deleteShipment(parcelCode: string): Promise<{ success: boolean; error?: string }> {
-    try {
-      const res = await fetch(
-        `${this.baseUrl}/customer/Delivery/Parcels/Action/Type/Delete?ParcelCode=${encodeURIComponent(parcelCode)}`,
-        {
-          method: 'DELETE',
-          headers: getHeaders(this.creds),
-        }
-      )
-
-      if (res.status === 200) {
-        return { success: true }
-      }
-
-      const data = await res.json().catch(() => null)
-      return {
-        success: false,
-        error: data?.message || `HTTP ${res.status}`,
-      }
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to delete shipment',
-      }
-    }
+    const result = await this.request({
+      method: 'DELETE',
+      path: '/customer/Delivery/Parcels/Action/Type/Delete',
+      query: { ParcelCode: parcelCode },
+      retry: false,
+    })
+    return result.ok ? { success: true } : { success: false, error: result.error }
   }
 
   /**
-   * Relaunch a parcel
-   * Endpoint: GET /customer/Delivery/Parcels/Action/Type/Relaunch
+   * Relance un colis interrompu.
+   * GET /customer/Delivery/Parcels/Action/Type/Relaunch
    */
   async relaunchShipment(parcelCode: string): Promise<{ success: boolean; error?: string }> {
-    try {
-      const res = await fetch(
-        `${this.baseUrl}/customer/Delivery/Parcels/Action/Type/Relaunch?ParcelCode=${encodeURIComponent(parcelCode)}`,
-        {
-          method: 'GET',
-          headers: getHeaders(this.creds),
-        }
-      )
-
-      if (res.status === 200) {
-        return { success: true }
-      }
-
-      const data = await res.json().catch(() => null)
-      return {
-        success: false,
-        error: data?.message || `HTTP ${res.status}`,
-      }
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to relaunch shipment',
-      }
-    }
+    const result = await this.request({
+      method: 'GET',
+      path: '/customer/Delivery/Parcels/Action/Type/Relaunch',
+      query: { ParcelCode: parcelCode },
+      retry: false,
+    })
+    return result.ok ? { success: true } : { success: false, error: result.error }
   }
 
   /**
-   * Relaunch parcel with new customer
-   * Endpoint: POST /customer/Delivery/Parcels/Action/Type/RelaunchNew
+   * Relance un colis en changeant le destinataire.
+   * POST /customer/Delivery/Parcels/Action/Type/RelaunchNew
    */
-  async relaunchShipmentNewCustomer(parcelCode: string, request: {
-    receiver: string
-    phone: string
-    city: string
-    address: string
-    price: number
-    comment?: string
-  }): Promise<{ success: boolean; error?: string }> {
+  async relaunchShipmentNewCustomer(
+    parcelCode: string,
+    updates: { receiver: string; phone: string; city: string; address: string; price: number; comment?: string }
+  ): Promise<{ success: boolean; error?: string }> {
     const form = new URLSearchParams()
-    form.append('receiver', request.receiver)
-    form.append('phone', request.phone)
-    form.append('city', String(request.city))
-    form.append('address', request.address)
-    form.append('price', String(request.price))
-    if (request.comment) form.append('comment', request.comment)
+    form.append('receiver', updates.receiver)
+    form.append('phone', updates.phone)
+    form.append('city', updates.city)
+    form.append('address', updates.address)
+    form.append('price', String(updates.price))
+    if (updates.comment) form.append('comment', updates.comment)
 
-    try {
-      const res = await fetch(
-        `${this.baseUrl}/customer/Delivery/Parcels/Action/Type/RelaunchNew?ParcelCode=${encodeURIComponent(parcelCode)}`,
-        {
-          method: 'POST',
-          headers: {
-            ...getHeaders(this.creds),
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          body: form.toString(),
-        }
-      )
-
-      if (res.status === 200) {
-        return { success: true }
-      }
-
-      const data = await res.json().catch(() => null)
-      return {
-        success: false,
-        error: data?.message || `HTTP ${res.status}`,
-      }
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to relaunch shipment with new customer',
-      }
-    }
+    const result = await this.request({
+      method: 'POST',
+      path: '/customer/Delivery/Parcels/Action/Type/RelaunchNew',
+      query: { ParcelCode: parcelCode },
+      form,
+      retry: false,
+    })
+    return result.ok ? { success: true } : { success: false, error: result.error }
   }
 
   /**
-   * Get parcels list (mass tracking)
-   * Endpoint: POST /customer/Delivery/Parcels/Json
+   * Liste paginée des colis du compte.
+   * POST /customer/Delivery/Parcels/Json
    */
-  async getParcelsList(filters: {
-    start?: number
-    length?: number
-    search?: string
-    business?: string
-    statut?: string
-    dateFrom?: string
-    dateTo?: string
-  } = {}): Promise<{ success: boolean; data?: any; error?: string }> {
+  async listParcels(
+    filters: {
+      start?: number
+      length?: number
+      search?: string
+      business?: string
+      statut?: string
+      dateFrom?: string
+      dateTo?: string
+    } = {}
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     const form = new URLSearchParams()
     form.append('start', String(filters.start ?? 0))
-    form.append('length', String(filters.length ?? 10))
-    if (filters.search) form.append('search[value]', filters.search)
+    form.append('length', String(filters.length ?? 20))
+    form.append('search[value]', filters.search ?? '')
     form.append('search[regex]', 'false')
     if (filters.business) form.append('business', filters.business)
     if (filters.statut) form.append('statut', filters.statut)
@@ -545,106 +586,49 @@ export class AmexAdapter {
     if (filters.dateTo) form.append('date[to]', filters.dateTo)
     form.append('all_data', '0')
 
-    try {
-      const res = await fetch(
-        `${this.baseUrl}/customer/Delivery/Parcels/Json`,
-        {
-          method: 'POST',
-          headers: {
-            ...getHeaders(this.creds),
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          body: form.toString(),
-        }
-      )
-
-      const data = await res.json().catch(() => null)
-
-      if (res.status === 200) {
-        return { success: true, data }
-      }
-
-      return {
-        success: false,
-        error: data?.message || `HTTP ${res.status}`,
-      }
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to fetch parcels list',
-      }
-    }
+    const result = await this.request({
+      method: 'POST',
+      path: '/customer/Delivery/Parcels/Json',
+      form,
+    })
+    return result.ok ? { success: true, data: result.data } : { success: false, error: result.error }
   }
 
   /**
-   * Generate shipping label
-   * Note: AMEEX doesn't have a dedicated label endpoint, so we use Info endpoint
+   * URL d'étiquette. AMEEX n'expose pas d'endpoint dédié : l'URL est portée
+   * par la réponse de création ou d'info.
    */
-  async generateLabel(shipmentId: string): Promise<{ success: boolean; labelUrl?: string; error?: string }> {
-    try {
-      const res = await fetch(
-        `${this.baseUrl}/customer/Delivery/Parcels/Info?ParcelCode=${encodeURIComponent(shipmentId)}`,
-        {
-          method: 'GET',
-          headers: getHeaders(this.creds),
-        }
-      )
-
-      const data = await res.json().catch(() => null)
-      const labelUrl = data?.label_url || data?.labelUrl
-
-      if (res.status === 200 && labelUrl) {
-        return { success: true, labelUrl }
-      }
-
-      return {
-        success: false,
-        error: data?.message || 'Label URL not found in response',
-      }
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to generate label',
-      }
-    }
+  async getLabelUrl(parcelCode: string): Promise<{ success: boolean; labelUrl?: string; error?: string }> {
+    const info = await this.getParcelInfo(parcelCode)
+    const data = info.data as Record<string, any> | null
+    const labelUrl = data?.label_url || data?.labelUrl
+    if (info.success && labelUrl) return { success: true, labelUrl }
+    return { success: false, error: info.error || "URL d'étiquette absente de la réponse AMEEX" }
   }
 
   /**
-   * Cancel shipment (alias for delete)
-   */
-  async cancelShipment(shipmentId: string, reason: string): Promise<{ success: boolean; error?: string }> {
-    return this.deleteShipment(shipmentId)
-  }
-
-  /**
-   * Verify a webhook signature using HMAC-SHA256 and a timing-safe comparison.
-   *
-   * The raw request body must be passed verbatim: any re-serialisation changes
-   * the bytes and the digest will not match.
+   * Vérifie une signature webhook (HMAC-SHA256, comparaison à temps constant).
+   * Le corps brut doit être transmis tel quel.
    */
   verifyWebhookSignature(payload: string, signature: string, secret: string): boolean {
-    if (!signature || signature.trim() === '' || !secret) {
-      return false
-    }
+    if (!signature || signature.trim() === '' || !secret) return false
 
     const expected = createHmac('sha256', secret).update(payload, 'utf8').digest('hex')
-
-    // Accept both the bare hex digest and a "sha256=<digest>" prefixed form
     const provided = signature.trim().replace(/^sha256=/i, '').toLowerCase()
 
-    if (provided.length !== expected.length) {
-      return false
-    }
-
+    if (provided.length !== expected.length) return false
     return timingSafeEqualHex(provided, expected)
   }
 
   /**
-   * Map an AMEEX parcel status onto our internal ShipmentStatus enum.
-   * Unknown values fall back to ERROR so they are surfaced rather than dropped.
+   * Traduit un statut AMEEX vers `ShipmentStatus`.
+   * Une valeur inconnue devient ERROR : elle est signalée, jamais perdue.
    */
   mapShipmentStatus(rawStatus: string): ShipmentStatus {
-    const normalized = String(rawStatus || '').trim().toUpperCase().replace(/[\s-]+/g, '_')
+    const normalized = String(rawStatus || '')
+      .trim()
+      .toUpperCase()
+      .replace(/[\s-]+/g, '_')
 
     const known: Record<string, ShipmentStatus> = {
       CREATED: 'CREATED',
@@ -669,9 +653,7 @@ export class AmexAdapter {
     return known[normalized] ?? 'ERROR'
   }
 
-  /**
-   * Derive the Order status implied by a shipment status.
-   */
+  /** Statut de commande impliqué par un statut d'expédition. */
   mapOrderStatus(shipmentStatus: ShipmentStatus): OrderStatus | null {
     switch (shipmentStatus) {
       case 'PICKED_UP':
@@ -687,25 +669,26 @@ export class AmexAdapter {
       case 'ERROR':
         return 'SHIPMENT_ERROR'
       default:
-        // CREATED is already represented by OrderStatus.SHIPMENT_CREATED
+        // CREATED correspond déjà à OrderStatus.SHIPMENT_CREATED.
         return null
-    }
-  }
-
-  /**
-   * Parse webhook payload
-   */
-  parseWebhook(payload: unknown): { eventType: string; data: unknown } | null {
-    if (!payload || typeof payload !== 'object') return null
-    const p = payload as Record<string, unknown>
-    return {
-      eventType: (p.event_type as string) || (p.type as string) || 'unknown',
-      data: p,
     }
   }
 }
 
-export async function createAmeexAdapter(): Promise<AmexAdapter> {
-  const creds = await getCredentials()
-  return new AmexAdapter(creds)
+function extractError(payload: unknown, status: number): string {
+  if (payload && typeof payload === 'object') {
+    const p = payload as Record<string, unknown>
+    const message = p.message || p.error || p.detail
+    if (typeof message === 'string' && message) return message
+  }
+  return `AMEEX a répondu HTTP ${status}`
+}
+
+/** Raccourci : construit un adaptateur configuré, ou `null` si l'intégration manque. */
+export async function tryCreateAmeexAdapter(): Promise<AmexAdapter | null> {
+  try {
+    return await AmexAdapter.create()
+  } catch {
+    return null
+  }
 }

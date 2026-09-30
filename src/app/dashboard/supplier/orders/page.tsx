@@ -25,6 +25,7 @@ import {
   PaginationNext,
   PaginationPrevious,
 } from '@/components/ui'
+import { ShipmentStatusBadge } from '@/components/status-badge'
 import {
   Search,
   Loader2,
@@ -35,6 +36,10 @@ import {
   XCircle,
   Factory,
   PackageCheck,
+  Truck,
+  Copy,
+  Check,
+  Info,
 } from 'lucide-react'
 import { formatCurrency } from '@/lib/utils/helpers'
 
@@ -80,7 +85,12 @@ interface OrderData {
   createdAt: string
   reseller: { id: string; companyName: string } | null
   items: OrderItem[]
-  shipments?: { id: string; trackingCode: string | null; status: string }[]
+  shipments?: {
+    id: string
+    trackingCode: string | null
+    status: string
+    carrier: string
+  }[]
 }
 
 const STATUS_LABELS: Record<OrderStatus, string> = {
@@ -149,6 +159,12 @@ export default function SupplierOrdersPage() {
   }>({})
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
+
+  // Création d'expédition depuis une commande prête à expédier
+  const [creatingShipmentId, setCreatingShipmentId] = useState<string | null>(null)
+  const [shipmentNotice, setShipmentNotice] = useState<string | null>(null)
+  const [shipmentError, setShipmentError] = useState<string | null>(null)
+  const [copiedId, setCopiedId] = useState<string | null>(null)
 
   const fetchOrders = useCallback(async () => {
     setLoading(true)
@@ -223,7 +239,70 @@ export default function SupplierOrdersPage() {
     }
   }
 
+  /**
+   * La commande passe à SHIPMENT_CREATED par la création d'expédition elle-même :
+   * le serveur refuse `SHIPMENT_CREATED` sur PATCH /api/orders/[id].
+   */
+  async function handleCreateShipment(order: OrderData) {
+    setCreatingShipmentId(order.id)
+    setShipmentError(null)
+    setShipmentNotice(null)
+    try {
+      const response = await fetch('/api/shipments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ orderId: order.id }),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) {
+        throw new Error(data.error || "Erreur lors de la création de l'expédition")
+      }
+      setShipmentNotice(
+        data.reused
+          ? `Une expédition existait déjà pour ${data.orderNumber} (Code Suivi ${data.shipment?.trackingCode ?? '—'}).`
+          : `Expédition créée pour ${data.orderNumber} : Code Suivi ${data.shipment?.trackingCode ?? '—'}.`
+      )
+      await fetchOrders()
+    } catch (err) {
+      setShipmentError(
+        err instanceof Error ? err.message : "Erreur lors de la création de l'expédition"
+      )
+    } finally {
+      setCreatingShipmentId(null)
+    }
+  }
+
+  async function handleCopyTrackingCode(orderId: string, trackingCode: string) {
+    try {
+      await navigator.clipboard.writeText(trackingCode)
+      setCopiedId(orderId)
+      setTimeout(() => setCopiedId(null), 2000)
+    } catch {
+      setShipmentError(
+        'Copie impossible depuis ce navigateur : sélectionnez le Code Suivi manuellement.'
+      )
+    }
+  }
+
   function renderActionButtons(order: OrderData) {
+    // Une commande prête à expédier passe par la création d'expédition, pas par
+    // une transition de statut.
+    if (order.status === 'READY_TO_SHIP') {
+      const isCreating = creatingShipmentId === order.id
+      return (
+        <div className="flex flex-wrap justify-end gap-2">
+          <Button onClick={() => handleCreateShipment(order)} disabled={isCreating}>
+            {isCreating ? (
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+            ) : (
+              <Truck className="h-4 w-4 mr-2" />
+            )}
+            Créer l&apos;expédition
+          </Button>
+        </div>
+      )
+    }
+
     const actions = SUPPLIER_ACTIONS[order.status] || []
 
     if (actions.length === 0) {
@@ -300,6 +379,20 @@ export default function SupplierOrdersPage() {
         </div>
       )}
 
+      {shipmentError && (
+        <div className="flex items-start gap-2 rounded-lg bg-red-50 border border-red-200 p-3 text-red-800">
+          <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+          <span className="text-sm">{shipmentError}</span>
+        </div>
+      )}
+
+      {shipmentNotice && (
+        <div className="flex items-start gap-2 rounded-lg bg-green-50 border border-green-200 p-3 text-green-800">
+          <CheckCircle className="h-4 w-4 shrink-0 mt-0.5" />
+          <span className="text-sm">{shipmentNotice}</span>
+        </div>
+      )}
+
       {/* Table */}
       <div className="rounded-lg border border-gray-200 bg-white">
         <div className="relative w-full overflow-auto">
@@ -316,14 +409,15 @@ export default function SupplierOrdersPage() {
                   <TableHead>Articles</TableHead>
                   <TableHead className="text-right">Montant</TableHead>
                   <TableHead>Statut</TableHead>
-                  <TableHead>Date</TableHead>
+                  <TableHead className="hidden lg:table-cell">Code Suivi</TableHead>
+                  <TableHead className="hidden md:table-cell">Date</TableHead>
                   <TableHead className="text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {orders.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={7} className="px-6 py-4 text-center text-gray-500">
+                    <TableCell colSpan={8} className="px-6 py-4 text-center text-gray-500">
                       Aucune commande trouvée
                     </TableCell>
                   </TableRow>
@@ -370,7 +464,47 @@ export default function SupplierOrdersPage() {
                           {STATUS_LABELS[order.status]}
                         </Badge>
                       </TableCell>
-                      <TableCell className="text-gray-600">{formatDate(order.createdAt)}</TableCell>
+                      <TableCell className="hidden lg:table-cell">
+                        {order.shipments && order.shipments.length > 0 ? (
+                          <div className="space-y-1">
+                            {order.shipments.map((shipment) =>
+                              shipment.trackingCode ? (
+                                <div key={shipment.id} className="flex items-center gap-1.5">
+                                  <code className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-xs text-gray-900">
+                                    {shipment.trackingCode}
+                                  </code>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-6 w-6"
+                                    onClick={() =>
+                                      handleCopyTrackingCode(order.id, shipment.trackingCode as string)
+                                    }
+                                    title="Copier le Code Suivi"
+                                    aria-label="Copier le Code Suivi"
+                                  >
+                                    {copiedId === order.id ? (
+                                      <Check className="h-3.5 w-3.5 text-green-600" />
+                                    ) : (
+                                      <Copy className="h-3.5 w-3.5" />
+                                    )}
+                                  </Button>
+                                  <ShipmentStatusBadge status={shipment.status} />
+                                </div>
+                              ) : (
+                                <span key={shipment.id} className="text-xs text-gray-400">
+                                  En attente de Code Suivi
+                                </span>
+                              )
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-xs text-gray-400">—</span>
+                        )}
+                      </TableCell>
+                      <TableCell className="hidden md:table-cell text-gray-600">
+                        {formatDate(order.createdAt)}
+                      </TableCell>
                       <TableCell className="text-right">{renderActionButtons(order)}</TableCell>
                     </TableRow>
                   ))
@@ -450,6 +584,48 @@ export default function SupplierOrdersPage() {
               </p>
               {selectedOrder.customerNotes && (
                 <p className="text-gray-500 italic">Note : {selectedOrder.customerNotes}</p>
+              )}
+              {selectedOrder.shipments && selectedOrder.shipments.length > 0 && (
+                <div className="mt-3 rounded-lg border border-gray-200 p-3">
+                  <p className="font-medium text-gray-900 mb-2">Code Suivi</p>
+                  <ul className="space-y-1">
+                    {selectedOrder.shipments.map((shipment) => (
+                      <li key={shipment.id} className="flex items-center gap-2">
+                        <code className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-xs text-gray-900">
+                          {shipment.trackingCode || 'Non attribué'}
+                        </code>
+                        <ShipmentStatusBadge status={shipment.status} />
+                        <span className="text-xs text-gray-500">{shipment.carrier}</span>
+                        {shipment.trackingCode && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-6 w-6"
+                            onClick={() =>
+                              handleCopyTrackingCode(
+                                selectedOrder.id,
+                                shipment.trackingCode as string
+                              )
+                            }
+                            title="Copier le Code Suivi"
+                            aria-label="Copier le Code Suivi"
+                          >
+                            {copiedId === selectedOrder.id ? (
+                              <Check className="h-3.5 w-3.5 text-green-600" />
+                            ) : (
+                              <Copy className="h-3.5 w-3.5" />
+                            )}
+                          </Button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="mt-2 flex items-start gap-1.5 text-xs text-gray-500">
+                    <Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                    Si aucune notification automatique n&apos;est configurée, ce Code
+                    Suivi reste affiché et copiable pour être transmis manuellement.
+                  </p>
+                </div>
               )}
             </div>
 

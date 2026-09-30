@@ -4,6 +4,7 @@ import { auth } from '@/lib/auth/config'
 import { prisma } from '@/lib/db/prisma'
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
+import { refreshShipmentTracking, refreshStaleShipments } from '@/lib/shipments/tracking'
 
 // GET /api/admin/shipments - List shipments with filters (admin only)
 export async function GET(request: Request) {
@@ -100,6 +101,52 @@ export async function GET(request: Request) {
     console.error('[Admin Shipments GET] Error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la récupération des envois' },
+      { status: 500 }
+    )
+  }
+}
+
+/**
+ * POST /api/admin/shipments — relance le suivi des expéditions dont les
+ * données sont périmées (§6.2 étape 6 : « actualisé manuellement ou par
+ * interrogation périodique si autorisée »).
+ *
+ * `shipmentId` cible une expédition précise, sinon le lot de colis dont le
+ * suivi date de plus de `maxAgeMinutes`.
+ */
+export async function POST(request: Request) {
+  try {
+    const session = await auth()
+
+    if (!session?.user || session.user.role !== 'ADMIN') {
+      return NextResponse.json({ error: 'Non autorisé' }, { status: 403 })
+    }
+
+    const body = await request.json().catch(() => ({}))
+    const schema = z.object({
+      shipmentId: z.string().optional(),
+      maxAgeMinutes: z.number().int().positive().max(1440).default(30),
+    })
+    const validation = schema.safeParse(body)
+    if (!validation.success) {
+      return NextResponse.json({ error: 'Données invalides' }, { status: 400 })
+    }
+
+    if (validation.data.shipmentId) {
+      const result = await refreshShipmentTracking(validation.data.shipmentId, {
+        actorId: session.user.id,
+        request,
+      })
+      return NextResponse.json({ success: result.ok, ...result })
+    }
+
+    const summary = await refreshStaleShipments(validation.data.maxAgeMinutes)
+
+    return NextResponse.json({ success: true, ...summary })
+  } catch (error) {
+    console.error('[Admin Shipments POST] Error:', error)
+    return NextResponse.json(
+      { error: 'Erreur lors de la relance du suivi' },
       { status: 500 }
     )
   }

@@ -18,11 +18,13 @@ import {
   User,
   CreditCard,
   Search,
+  ShoppingCart,
 } from 'lucide-react'
 
 const navigation = [
   { name: 'Tableau de bord', href: '/dashboard/reseller', icon: LayoutDashboard },
   { name: 'Catalogue', href: '/dashboard/reseller/catalog', icon: Search },
+  { name: 'Mon panier', href: '/dashboard/reseller/cart', icon: ShoppingCart },
   { name: 'Mes commandes', href: '/dashboard/reseller/orders', icon: ShoppingBag },
   { name: 'Expéditions', href: '/dashboard/reseller/shipments', icon: Truck },
   { name: 'Marges & Commissions', href: '/dashboard/reseller/commissions', icon: CreditCard },

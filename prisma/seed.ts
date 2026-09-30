@@ -1,7 +1,18 @@
 import { PrismaClient, UserRole, UserStatus, ProductStatus, OrderStatus } from '@prisma/client'
+import { PrismaPg } from '@prisma/adapter-pg'
+import { Pool } from 'pg'
 import { hashPassword } from '../src/lib/auth/password'
 
-const prisma = new PrismaClient()
+const connectionString = process.env.DATABASE_URL!
+
+if (!connectionString) {
+  throw new Error('DATABASE_URL is required to run the seed')
+}
+
+const pool = new Pool({ connectionString })
+const adapter = new PrismaPg(pool)
+
+const prisma = new PrismaClient({ adapter })
 
 async function main() {
   console.log('🌱 Starting database seed...')
@@ -260,26 +271,50 @@ async function main() {
 
   console.log('✅ Platform settings created')
 
-  // Create AMEEX integration config (placeholder)
-  await prisma.courierIntegration.upsert({
-    where: { id: 'ameex-main' },
-    update: {},
-    create: {
-      id: 'ameex-main',
-      name: 'AMEEX',
-      isActive: true,
-      apiKey: 'ENCRYPTED_PLACEHOLDER',
-      apiSecret: 'ENCRYPTED_PLACEHOLDER',
-      accountId: 'AMEEX-DEMO',
-      baseUrl: 'https://api.ameex.ma',
-      testMode: true,
-      config: {
-        webhookUrl: 'https://fabli.ma/api/webhooks/ameex',
-      },
-    },
-  })
+  // Intégration AMEEX : aucune ligne n'est créée avec des identifiants factices.
+  // Les identifiants réels sont saisis par l'administrateur depuis
+  // /dashboard/admin/ameex, ce qui les chiffre au repos (§6.5). Une ligne avec
+  // des valeurs « placeholder » ferait croire à une intégration configurée tout
+  // en échouant sur le premier appel.
+  await prisma.courierIntegration.deleteMany({ where: { name: 'AMEEX' } })
+  console.log('ℹ️  Intégration AMEEX non amorcée : à configurer depuis /dashboard/admin/ameex')
 
-  console.log('✅ AMEEX integration config created')
+  // Référentiel villes : l'API AMEEX attend un identifiant de ville, pas un
+  // nom libre. Sans correspondance, la création d'expédition est refusée avec
+  // un message explicite. Les identifiants ci-dessous sont des exemples : ils
+  // doivent être remplacés par les valeurs réelles du compte AMEEX.
+  const cities = [
+    { name: 'Casablanca', ameexId: '1' },
+    { name: 'Rabat', ameexId: '2' },
+    { name: 'Marrakech', ameexId: '3' },
+    { name: 'Fès', ameexId: '4' },
+    { name: 'Tanger', ameexId: '5' },
+    { name: 'Agadir', ameexId: '6' },
+    { name: 'Meknès', ameexId: '7' },
+    { name: 'Oujda', ameexId: '8' },
+    { name: 'Kénitra', ameexId: '9' },
+    { name: 'Tétouan', ameexId: '10' },
+    { name: 'Safi', ameexId: '11' },
+    { name: 'Salé', ameexId: '12' },
+    { name: 'Témara', ameexId: '13' },
+    { name: 'Essaouira', ameexId: '14' },
+    { name: 'El Jadida', ameexId: '15' },
+    { name: 'Béni Mellal', ameexId: '16' },
+    { name: 'Nador', ameexId: '17' },
+    { name: 'Khouribga', ameexId: '18' },
+    { name: 'Berrechid', ameexId: '19' },
+    { name: 'Ouarzazate', ameexId: '20' },
+  ]
+
+  for (const city of cities) {
+    await prisma.city.upsert({
+      where: { name: city.name },
+      update: {},
+      create: { name: city.name, ameexId: city.ameexId, isActive: true },
+    })
+  }
+
+  console.log(`✅ ${cities.length} villes de référence créées (identifiants AMEEX à confirmer)`)
 
   console.log('🎉 Database seed completed successfully!')
 }

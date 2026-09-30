@@ -1,7 +1,10 @@
-version: '3.8'
+# Compose stack — production deployment on a private server (§10)
+#
+# Required environment variables: see .env.example
+#   DOMAIN, NEXTAUTH_SECRET, NEXTAUTH_URL, DATABASE_URL, POSTGRES_PASSWORD,
+#   AMEEX_ENCRYPTION_KEY
 
 services:
-  # PostgreSQL - local database for development and production
   postgres:
     image: postgres:16-alpine
     container_name: fabli-postgres
@@ -11,12 +14,33 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./docker/postgres/init:/docker-entrypoint-initdb.d
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./backups:/backups
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fabli} -d ${POSTGRES_DB:-fabli}"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - fabli-network
+    restart: unless-stopped
+
+  # Daily logical backups, retained 14 days (§9 "sauvegardes régulières")
+  backup:
+    image: postgres:16-alpine
+    container_name: fabli-backup
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-fabli}
+      POSTGRES_USER: ${POSTGRES_USER:-fabli}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - ./backups:/backups
+      - ./docker/backup:/scripts:ro
+    entrypoint: ["/bin/sh", "/scripts/backup.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - fabli-network
     restart: unless-stopped
@@ -30,12 +54,15 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
       NEXTAUTH_URL: ${NEXTAUTH_URL}
+      AMEEX_ENCRYPTION_KEY: ${AMEEX_ENCRYPTION_KEY}
+      HOSTNAME: 0.0.0.0
+      PORT: 3000
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: 1
+      UPLOAD_DIR: /app/public/uploads
     depends_on:
       postgres:
         condition: service_healthy
-        required: false
     volumes:
       - ./public/uploads:/app/public/uploads
     networks:
@@ -45,12 +72,15 @@ services:
   nginx:
     image: nginx:alpine
     container_name: fabli-nginx
+    environment:
+      DOMAIN: ${DOMAIN}
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
+      # Rendered at startup by the image's envsubst entrypoint into conf.d
+      - ./docker/nginx/templates:/etc/nginx/templates:ro
       - ./docker/certbot/conf:/etc/letsencrypt:ro
       - ./docker/certbot/www:/var/www/certbot:ro
       - ./public/uploads:/var/www/uploads:ro
@@ -66,7 +96,7 @@ services:
     volumes:
       - ./docker/certbot/conf:/etc/letsencrypt
       - ./docker/certbot/www:/var/www/certbot
-    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew > /dev/null 2>&1; sleep 12h & wait \$\${!}; done'"
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done'"
     networks:
       - fabli-network
     restart: unless-stopped

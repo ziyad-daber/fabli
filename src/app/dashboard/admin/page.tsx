@@ -1,200 +1,483 @@
 'use client'
 
-import { useSession } from 'next-auth/react'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { Button } from '@/components/ui/button'
+import { useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
-import { cn } from '@/lib/utils/helpers'
 import {
-  Users,
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui'
+import { OrderStatusBadge } from '@/components/status-badge'
+import { formatCurrency, formatDateTime } from '@/lib/utils/helpers'
+import {
+  AlertTriangle,
+  CreditCard,
+  Info,
+  Loader2,
   Package,
+  RefreshCw,
+  Shield,
   ShoppingBag,
   Truck,
-  CreditCard,
-  FileText,
-  Settings,
-  Shield,
-  BarChart3,
-  TrendingUp,
-  AlertTriangle,
+  Users,
+  Wallet,
+  XCircle,
 } from 'lucide-react'
 
-const stats = [
-  { name: 'Utilisateurs totaux', value: '156', change: '+12 ce mois', icon: Users, color: 'text-blue-600', bg: 'bg-blue-100' },
-  { name: 'Fournisseurs actifs', value: '23', change: '+3 en attente', icon: Shield, color: 'text-green-600', bg: 'bg-green-100' },
-  { name: 'Produits publiés', value: '187', change: '+8 cette semaine', icon: Package, color: 'text-purple-600', bg: 'bg-purple-100' },
-  { name: 'Commandes ce mois', value: '342', change: '+15% vs mois dernier', icon: ShoppingBag, color: 'text-orange-600', bg: 'bg-orange-100' },
-]
+type Decimal = string | number | null
 
-const recentActivity = [
-  { id: '1', type: 'user_registered', message: 'Nouveau fournisseur inscrit: Imprim3D Agadir', time: 'Il y a 10 min', icon: Shield, color: 'text-green-600 bg-green-100' },
-  { id: '2', type: 'order_created', message: 'Commande #FAB-2026-000145 créée par ElectroShop', time: 'Il y a 25 min', icon: ShoppingBag, color: 'text-blue-600 bg-blue-100' },
-  { id: '3', type: 'shipment_created', message: 'Expédition AMEEX créée: SUIVI-MA-123456', time: 'Il y a 1h', icon: Truck, color: 'text-purple-600 bg-purple-100' },
-  { id: '4', type: 'product_pending', message: 'Produit en attente de modération: "Support mural"', time: 'Il y a 2h', icon: Package, color: 'text-yellow-600 bg-yellow-100' },
-  { id: '5', type: 'settlement_due', message: 'Règlement fournisseur dû: TechPrint Casablanca - 12,450 MAD', time: 'Il y a 3h', icon: CreditCard, color: 'text-red-600 bg-red-100' },
-]
+interface StatsResponse {
+  users: {
+    total: number
+    pendingValidation: number
+    suppliers: number
+    resellers: number
+  }
+  products: { total: number; active: number; draft: number }
+  orders: {
+    total: number
+    thisMonth: number
+    delivered: number
+    pending: number
+    inProgress: number
+    byStatus: Record<string, number>
+    stalled: number
+  }
+  shipments: {
+    total: number
+    inTransit: number
+    delivered: number
+    errors: number
+    byStatus: Record<string, number>
+  }
+  finance: {
+    codDeliveredRevenue: number
+    commissions: Record<string, { count: number; amount: number }>
+    cod: Record<string, { count: number; expected: number; collected: number }>
+  }
+  recentOrders: Array<{
+    id: string
+    orderNumber: string
+    status: string
+    codAmount: Decimal
+    createdAt: string
+    customerName: string
+    supplier: { companyName: string } | null
+  }>
+  alerts: Array<{ level: 'info' | 'warning' | 'error'; message: string; href?: string }>
+}
 
-const alerts = [
-  { message: '3 fournisseurs en attente de validation', action: 'Voir', href: '/dashboard/admin/suppliers?status=pending' },
-  { message: '5 produits signalés pour modération', action: 'Modérer', href: '/dashboard/admin/products?status=pending' },
-  { message: '2 expéditions AMEEX en erreur', action: 'Corriger', href: '/dashboard/admin/shipments?status=error' },
-]
+const COMMISSION_STATUS_LABELS: Record<string, string> = {
+  PENDING: 'En attente',
+  DUE: 'Dûe',
+  PAID: 'Réglée',
+  DISPUTED: 'Contestée',
+  REFUNDED: 'Remboursée',
+}
+
+const COD_STATUS_LABELS: Record<string, string> = {
+  EXPECTED: 'Attendu',
+  COLLECTED: 'Encaissé',
+  SETTLED: 'Reversé',
+  DISCREPANCY: 'Écart',
+  REFUNDED: 'Remboursé',
+}
+
+const ALERT_STYLES: Record<'info' | 'warning' | 'error', string> = {
+  info: 'bg-blue-50 border-blue-200 text-blue-800',
+  warning: 'bg-yellow-50 border-yellow-200 text-yellow-800',
+  error: 'bg-red-50 border-red-200 text-red-800',
+}
+
+function amount(value: Decimal): number {
+  const parsed = typeof value === 'string' ? parseFloat(value) : (value ?? 0)
+  return Number.isFinite(parsed) ? parsed : 0
+}
 
 export default function AdminDashboardPage() {
-  const { data: session } = useSession()
+  const [stats, setStats] = useState<StatsResponse | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const fetchStats = useCallback(async (signal: AbortSignal) => {
+    setLoading(true)
+    setError(null)
+    try {
+      const response = await fetch('/api/admin/stats', { signal })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) {
+        throw new Error(data.error || 'Erreur lors du chargement des statistiques')
+      }
+      setStats(data as StatsResponse)
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return
+      setError(err instanceof Error ? err.message : 'Une erreur est survenue')
+    } finally {
+      if (!signal.aborted) setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void fetchStats(controller.signal)
+    return () => controller.abort()
+  }, [fetchStats])
+
+  if (loading && !stats) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      </div>
+    )
+  }
+
+  if (error && !stats) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg bg-red-50 border border-red-200 p-3 text-red-800">
+        <AlertTriangle className="h-4 w-4 shrink-0" />
+        <span className="text-sm">{error}</span>
+      </div>
+    )
+  }
+
+  if (!stats) return null
+
+  const commissionEntries = Object.entries(stats.finance.commissions ?? {})
+  const codEntries = Object.entries(stats.finance.cod ?? {})
+
+  const codExpected = codEntries.reduce((sum, [, value]) => sum + amount(value.expected), 0)
+  const codCollected = codEntries.reduce((sum, [, value]) => sum + amount(value.collected), 0)
+
+  const kpis = [
+    {
+      name: 'Utilisateurs',
+      value: stats.users.total.toString(),
+      detail: `${stats.users.suppliers} fournisseurs · ${stats.users.resellers} revendeurs`,
+      href: '/dashboard/admin/users',
+      icon: Users,
+      color: 'text-blue-600',
+    },
+    {
+      name: 'En attente de validation',
+      value: stats.users.pendingValidation.toString(),
+      detail: 'comptes à valider',
+      href: '/dashboard/admin/users?status=PENDING_VERIFICATION',
+      icon: Shield,
+      color: stats.users.pendingValidation > 0 ? 'text-amber-600' : 'text-gray-600',
+    },
+    {
+      name: 'Produits actifs',
+      value: stats.products.active.toString(),
+      detail: `${stats.products.draft} brouillon(s) sur ${stats.products.total}`,
+      href: '/dashboard/admin/products',
+      icon: Package,
+      color: 'text-purple-600',
+    },
+    {
+      name: 'Commandes ce mois',
+      value: stats.orders.thisMonth.toString(),
+      detail: `${stats.orders.total} au total`,
+      href: '/dashboard/admin/orders',
+      icon: ShoppingBag,
+      color: 'text-orange-600',
+    },
+    {
+      name: 'Commandes livrées',
+      value: stats.orders.delivered.toString(),
+      detail: `${stats.orders.inProgress} en cours · ${stats.orders.pending} en attente`,
+      href: '/dashboard/admin/orders',
+      icon: ShoppingBag,
+      color: 'text-green-600',
+    },
+    {
+      name: 'Expéditions en transit',
+      value: stats.shipments.inTransit.toString(),
+      detail:
+        stats.shipments.errors > 0
+          ? `${stats.shipments.errors} en erreur`
+          : 'aucune erreur',
+      href: '/dashboard/admin/shipments',
+      icon: Truck,
+      color: stats.shipments.errors > 0 ? 'text-red-600' : 'text-sky-600',
+    },
+  ]
 
   return (
     <div className="space-y-6">
-      {/* Welcome header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Tableau de bord administrateur</h1>
-          <p className="text-gray-500">Vue d'ensemble de la plateforme Fabli</p>
+          <p className="text-gray-500">Vue d’ensemble de la plateforme Fabli</p>
         </div>
+        <button
+          type="button"
+          onClick={() => {
+            const controller = new AbortController()
+            void fetchStats(controller.signal)
+          }}
+          className="inline-flex items-center gap-2 rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+        >
+          <RefreshCw className={loading ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />
+          Actualiser
+        </button>
       </div>
 
-      {/* Alerts */}
-      {alerts.length > 0 && (
-        <div className="space-y-2">
-          {alerts.map((alert, index) => (
-            <div key={index} className="flex items-center justify-between p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
-              <span className="text-sm text-yellow-800">{alert.message}</span>
-              <Link href={alert.href} className="text-sm font-medium text-yellow-700 hover:underline">
-                {alert.action}
-              </Link>
-            </div>
-          ))}
+      {error && (
+        <div className="flex items-center gap-2 rounded-lg bg-red-50 border border-red-200 p-3 text-red-800">
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          <span className="text-sm">{error}</span>
         </div>
       )}
 
-      {/* Stats grid */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        {stats.map((stat) => (
-          <Card key={stat.name}>
+      {/* KPI */}
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+        {kpis.map((kpi) => (
+          <Card key={kpi.name}>
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-              <CardTitle className="text-sm font-medium text-gray-500">{stat.name}</CardTitle>
-              <stat.icon className={cn('h-4 w-4', stat.color)} aria-hidden="true" />
+              <CardTitle className="text-sm font-medium text-gray-500">{kpi.name}</CardTitle>
+              <kpi.icon className={`h-4 w-4 ${kpi.color}`} aria-hidden="true" />
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold text-gray-900">{stat.value}</div>
-              <p className="text-xs text-gray-500 mt-1">{stat.change}</p>
+              <div className="text-2xl font-bold text-gray-900">{kpi.value}</div>
+              <Link
+                href={kpi.href}
+                className="mt-1 block text-xs text-gray-500 hover:underline"
+              >
+                {kpi.detail}
+              </Link>
             </CardContent>
           </Card>
         ))}
       </div>
 
-      {/* Quick actions & Recent activity */}
+      {/* Commandes récentes + alertes */}
       <div className="grid gap-6 lg:grid-cols-3">
-        <div className="lg:col-span-1 space-y-4">
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-lg">Actions rapides</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <Link href="/dashboard/admin/users/new">
-                <Button variant="outline" className="w-full justify-start gap-2">
-                  <Users className="h-4 w-4" />
-                  Ajouter un utilisateur
-                </Button>
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle className="text-lg">Commandes récentes</CardTitle>
+            <CardDescription>
+              CA encaissé sur les commandes livrées :{' '}
+              {formatCurrency(stats.finance.codDeliveredRevenue)}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="relative w-full overflow-auto">
+              {stats.recentOrders.length === 0 ? (
+                <p className="py-8 text-center text-sm text-gray-500">Aucune commande</p>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Commande</TableHead>
+                      <TableHead>Fournisseur</TableHead>
+                      <TableHead>Client</TableHead>
+                      <TableHead>Montant</TableHead>
+                      <TableHead>Statut</TableHead>
+                      <TableHead>Créée le</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {stats.recentOrders.map((order) => (
+                      <TableRow key={order.id}>
+                        <TableCell className="font-medium text-gray-900">
+                          {order.orderNumber}
+                        </TableCell>
+                        <TableCell className="text-gray-600">
+                          {order.supplier?.companyName ?? '—'}
+                        </TableCell>
+                        <TableCell className="text-gray-600">{order.customerName}</TableCell>
+                        <TableCell className="text-gray-900">
+                          {formatCurrency(amount(order.codAmount))}
+                        </TableCell>
+                        <TableCell>
+                          <OrderStatusBadge status={order.status} />
+                        </TableCell>
+                        <TableCell className="text-gray-600">
+                          {formatDateTime(order.createdAt)}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </div>
+            <div className="mt-4 text-center border-t border-gray-100 pt-4">
+              <Link
+                href="/dashboard/admin/orders"
+                className="text-sm text-primary hover:underline"
+              >
+                Toutes les commandes
               </Link>
-              <Link href="/dashboard/admin/suppliers">
-                <Button variant="outline" className="w-full justify-start gap-2">
-                  <Shield className="h-4 w-4" />
-                  Valider fournisseurs
-                </Button>
-              </Link>
-              <Link href="/dashboard/admin/products">
-                <Button variant="outline" className="w-full justify-start gap-2">
-                  <Package className="h-4 w-4" />
-                  Modérer produits
-                </Button>
-              </Link>
-              <Link href="/dashboard/admin/orders">
-                <Button variant="outline" className="w-full justify-start gap-2">
-                  <ShoppingBag className="h-4 w-4" />
-                  Gérer commandes
-                </Button>
-              </Link>
-              <Link href="/dashboard/admin/shipments">
-                <Button variant="outline" className="w-full justify-start gap-2">
-                  <Truck className="h-4 w-4" />
-                  Expéditions AMEEX
-                </Button>
-              </Link>
-              <Link href="/dashboard/admin/settlements">
-                <Button variant="outline" className="w-full justify-start gap-2">
-                  <FileText className="h-4 w-4" />
-                  Règlements fournisseurs
-                </Button>
-              </Link>
-              <Link href="/dashboard/admin/ameex">
-                <Button variant="outline" className="w-full justify-start gap-2">
-                  <Settings className="h-4 w-4" />
-                  Config AMEEX
-                </Button>
-              </Link>
-              <Link href="/dashboard/admin/analytics">
-                <Button variant="outline" className="w-full justify-start gap-2">
-                  <BarChart3 className="h-4 w-4" />
-                  Analytics
-                </Button>
-              </Link>
-            </CardContent>
-          </Card>
+            </div>
+          </CardContent>
+        </Card>
 
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-lg flex items-center gap-2">
-                <AlertTriangle className="h-4 w-4 text-yellow-600" />
-                Alertes
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
-                <p className="text-sm font-medium text-red-800">2 expéditions en erreur</p>
-                <p className="text-xs text-red-600 mt-1">Vérifier l'intégration AMEEX</p>
-                <Link href="/dashboard/admin/shipments?status=error" className="text-xs text-red-700 hover:underline block mt-2">
-                  Voir détails
-                </Link>
-              </div>
-              <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
-                <p className="text-sm font-medium text-yellow-800">Règlements en retard</p>
-                <p className="text-xs text-yellow-600 mt-1">3 fournisseurs attendent paiement</p>
-                <Link href="/dashboard/admin/settlements?status=overdue" className="text-xs text-yellow-700 hover:underline block mt-2">
-                  Voir détails
-                </Link>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-lg flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 text-yellow-600" />
+              Alertes
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {stats.alerts.length === 0 ? (
+              <p className="text-sm text-gray-500">Aucune alerte active</p>
+            ) : (
+              stats.alerts.map((alert, index) => (
+                <div
+                  key={`${alert.message}-${index}`}
+                  className={`flex items-start justify-between gap-2 rounded-lg border p-3 ${ALERT_STYLES[alert.level]}`}
+                >
+                  <span className="text-sm">{alert.message}</span>
+                  {alert.href && (
+                    <Link href={alert.href} className="shrink-0 text-sm font-medium hover:underline">
+                      Voir
+                    </Link>
+                  )}
+                </div>
+              ))
+            )}
 
-        <div className="lg:col-span-2">
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-lg">Activité récente</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="space-y-4">
-                {recentActivity.map((activity) => (
-                  <div key={activity.id} className="flex items-start gap-4 p-3 hover:bg-gray-50 rounded-lg">
-                    <div className={cn('p-2 rounded-full', activity.color)}>
-                      <activity.icon className="h-5 w-5" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm text-gray-900">{activity.message}</p>
-                      <p className="text-xs text-gray-500 mt-0.5">{activity.time}</p>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <div className="text-center pt-4 border-t border-gray-100">
-                <Link href="/dashboard/admin/activity" className="text-primary text-sm hover:underline">
-                  Voir toute l'activité
+            {stats.orders.stalled > 0 && (
+              <div className="rounded-lg border border-orange-200 bg-orange-50 p-3">
+                <p className="text-sm font-medium text-orange-800">
+                  {stats.orders.stalled} commande(s) bloquée(s)
+                </p>
+                <p className="mt-1 text-xs text-orange-700">
+                  Aucun mouvement depuis 30 jours sur une commande acceptée ou en production.
+                </p>
+                <Link
+                  href="/dashboard/admin/orders"
+                  className="mt-2 block text-xs text-orange-800 hover:underline"
+                >
+                  Examiner les commandes
                 </Link>
               </div>
-            </CardContent>
-          </Card>
-        </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Finance */}
+      <div className="grid gap-6 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-lg flex items-center gap-2">
+              <CreditCard className="h-4 w-4 text-primary" />
+              Commissions par statut
+            </CardTitle>
+            <CardDescription>
+              Le taux s’applique aux nouvelles commandes : les commandes existantes gardent
+              leur taux figé.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            {commissionEntries.length === 0 ? (
+              <p className="text-sm text-gray-500">Aucune commission enregistrée</p>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Statut</TableHead>
+                    <TableHead className="text-right">Nombre</TableHead>
+                    <TableHead className="text-right">Montant</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {commissionEntries.map(([status, value]) => (
+                    <TableRow key={status}>
+                      <TableCell>
+                        {COMMISSION_STATUS_LABELS[status] ?? status}
+                      </TableCell>
+                      <TableCell className="text-right text-gray-600">{value.count}</TableCell>
+                      <TableCell className="text-right font-medium text-gray-900">
+                        {formatCurrency(amount(value.amount))}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+            <div className="mt-4 text-center border-t border-gray-100 pt-4">
+              <Link
+                href="/dashboard/admin/commissions"
+                className="text-sm text-primary hover:underline"
+              >
+                Détail des commissions
+              </Link>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-lg flex items-center gap-2">
+              <Wallet className="h-4 w-4 text-primary" />
+              Code Suivi (COD)
+            </CardTitle>
+            <CardDescription>
+              Attendu {formatCurrency(codExpected)} · encaissé {formatCurrency(codCollected)}
+              {codExpected > 0 && (
+                <span className={codCollected >= codExpected ? 'text-green-700' : 'text-red-700'}>
+                  {' '}
+                  ({Math.round((codCollected / codExpected) * 100)} %)
+                </span>
+              )}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            {codEntries.length === 0 ? (
+              <p className="text-sm text-gray-500">Aucune collecte COD enregistrée</p>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Statut</TableHead>
+                    <TableHead className="text-right">Nombre</TableHead>
+                    <TableHead className="text-right">Attendu</TableHead>
+                    <TableHead className="text-right">Encaissé</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {codEntries.map(([status, value]) => (
+                    <TableRow key={status}>
+                      <TableCell>{COD_STATUS_LABELS[status] ?? status}</TableCell>
+                      <TableCell className="text-right text-gray-600">{value.count}</TableCell>
+                      <TableCell className="text-right text-gray-900">
+                        {formatCurrency(amount(value.expected))}
+                      </TableCell>
+                      <TableCell className="text-right text-gray-900">
+                        {formatCurrency(amount(value.collected))}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+
+            {codEntries.some(([status]) => status === 'DISCREPANCY') && (
+              <div className="mt-4 flex items-center gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                <XCircle className="h-4 w-4 shrink-0" />
+                Des écarts de collecte sont à rapprocher.
+              </div>
+            )}
+
+            <div className="mt-4 flex items-center gap-2 border-t border-gray-100 pt-4 text-xs text-gray-500">
+              <Info className="h-3.5 w-3.5 shrink-0" />
+              <Link href="/dashboard/admin/cod" className="text-primary hover:underline">
+                Rapprocher les collectes COD
+              </Link>
+            </div>
+          </CardContent>
+        </Card>
       </div>
     </div>
   )

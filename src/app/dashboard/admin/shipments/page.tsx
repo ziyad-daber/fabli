@@ -24,7 +24,17 @@ import {
   PaginationNext,
   PaginationPrevious,
 } from '@/components/ui'
-import { Search, Loader2, AlertTriangle, Eye, Truck, X, ExternalLink } from 'lucide-react'
+import {
+  Search,
+  Loader2,
+  AlertTriangle,
+  Eye,
+  Truck,
+  X,
+  ExternalLink,
+  RefreshCw,
+  CheckCircle2,
+} from 'lucide-react'
 import { formatCurrency } from '@/lib/utils/helpers'
 
 type ShipmentStatus =
@@ -48,6 +58,7 @@ interface ShipmentData {
   weight: string | number | null
   codAmount: string | number | null
   errorMessage: string | null
+  isManual?: boolean
   createdAt: string
   pickedUpAt: string | null
   deliveredAt: string | null
@@ -60,6 +71,7 @@ interface ShipmentData {
     customerAddress: string
     customerCity: string
     customerPostalCode: string | null
+    status?: string
   } | null
 }
 
@@ -106,6 +118,10 @@ export default function AdminShipmentsPage() {
 
   const [selectedShipment, setSelectedShipment] = useState<ShipmentData | null>(null)
   const [isModalOpen, setIsModalOpen] = useState(false)
+  const [updatingId, setUpdatingId] = useState<string | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [actionNotice, setActionNotice] = useState<string | null>(null)
 
   const fetchShipments = useCallback(async () => {
     setLoading(true)
@@ -146,14 +162,93 @@ export default function AdminShipmentsPage() {
     setSelectedShipment(null)
   }
 
+  /**
+   * Relance le suivi d'une expédition (§6.2 étape 6). Utile quand AMEEX ne
+   * pousse pas de webhook exploitable, ou pour vérifier une erreur d compris.
+   */
+  async function handleTrack(shipment: ShipmentData) {
+    setActionError(null)
+    setActionNotice(null)
+    setUpdatingId(shipment.id)
+
+    try {
+      const response = await fetch(`/api/shipments/${shipment.id}`, { method: 'POST' })
+      const data = await response.json().catch(() => ({}))
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Erreur lors de la consultation du suivi')
+      }
+
+      if (data.skipped) {
+        setActionNotice(data.skipped)
+      } else {
+        setActionNotice(`Suivi actualisé : ${data.status ?? 'statut inconnu'}`)
+      }
+      await fetchShipments()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Erreur lors de la consultation')
+    } finally {
+      setUpdatingId(null)
+    }
+  }
+
+  /** Relance en lot les expéditions dont le suivi est périmé. */
+  async function handleRefreshAll() {
+    setRefreshing(true)
+    setActionError(null)
+    setActionNotice(null)
+
+    try {
+      const response = await fetch('/api/admin/shipments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ maxAgeMinutes: 30 }),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) {
+        throw new Error(data.error || 'Erreur lors de la relance du suivi')
+      }
+      setActionNotice(
+        `${data.updated ?? 0} actualisée(s), ${data.failed ?? 0} en échec, sur ${
+          data.scanned ?? 0
+        } suivie(s) dont le suivi datait de plus de 30 min.`
+      )
+      await fetchShipments()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Erreur lors de la relance')
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-gray-900">Gestion des expéditions</h1>
-        <p className="text-gray-500">
-          {total} expédition{total > 1 ? 's' : ''} suivie{total > 1 ? 's' : ''} via AMEEX
-        </p>
+      <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Gestion des expéditions</h1>
+          <p className="text-gray-500">
+            {total} expédition{total > 1 ? 's' : ''} suivie{total > 1 ? 's' : ''} via AMEEX
+          </p>
+        </div>
+        <Button variant="outline" onClick={handleRefreshAll} disabled={refreshing}>
+          <RefreshCw className={`h-4 w-4 mr-2${refreshing ? ' animate-spin' : ''}`} />
+          Actualiser les suivis
+        </Button>
       </div>
+
+      {actionNotice && (
+        <div className="flex items-start gap-2 rounded-lg bg-green-50 px-4 py-3 text-sm text-green-800 border border-green-200">
+          <CheckCircle2 className="h-4 w-4 mt-0.5 shrink-0" />
+          <p>{actionNotice}</p>
+        </div>
+      )}
+
+      {actionError && (
+        <div className="flex items-start gap-2 rounded-lg bg-red-50 px-4 py-3 text-sm text-red-800 border border-red-200">
+          <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+          <p>{actionError}</p>
+        </div>
+      )}
 
       {/* Filters */}
       <div className="grid gap-3 sm:grid-cols-2">
@@ -251,9 +346,22 @@ export default function AdminShipmentsPage() {
                           : '—'}
                       </TableCell>
                       <TableCell>
-                        <Badge className={STATUS_STYLES[shipment.status]}>
-                          {STATUS_LABELS[shipment.status]}
-                        </Badge>
+                        <div className="flex flex-col items-start gap-1">
+                          <Badge className={STATUS_STYLES[shipment.status]}>
+                            {STATUS_LABELS[shipment.status]}
+                          </Badge>
+                          {shipment.isManual && (
+                            <span className="text-[11px] text-gray-500">Saisie manuelle</span>
+                          )}
+                          {shipment.errorMessage && (
+                            <span
+                              className="text-[11px] text-red-700 max-w-[180px] truncate"
+                              title={shipment.errorMessage}
+                            >
+                              {shipment.errorMessage}
+                            </span>
+                          )}
+                        </div>
                       </TableCell>
                       <TableCell className="text-gray-600">
                         {formatDate(shipment.createdAt)}
@@ -265,6 +373,21 @@ export default function AdminShipmentsPage() {
                               <a href={shipment.labelUrl} target="_blank" rel="noreferrer">
                                 <ExternalLink className="h-4 w-4" />
                               </a>
+                            </Button>
+                          )}
+                          {!shipment.isManual && !['DELIVERED', 'RETURNED'].includes(shipment.status) && (
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              title="Actualiser le suivi"
+                              disabled={updatingId === shipment.id}
+                              onClick={() => handleTrack(shipment)}
+                            >
+                              {updatingId === shipment.id ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <RefreshCw className="h-4 w-4" />
+                              )}
                             </Button>
                           )}
                           <Button

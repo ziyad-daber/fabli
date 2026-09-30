@@ -1,5 +1,6 @@
 import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
+import { randomBytes, randomInt } from 'crypto'
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
@@ -35,6 +36,11 @@ export function generateOrderNumber(): string {
   return `FAB-${year}-${random}`
 }
 
+/**
+ * Clé d'idempotence d'une expédition.
+ * Transmise à AMEEX comme `exchange_code` : un double clic ou un réessai après
+ * timeout ne crée pas de doublon côté transporteur.
+ */
 export function generateIdempotencyKey(prefix = 'ship'): string {
-  return `${prefix}_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`
+  return `${prefix}_${Date.now()}_${randomBytes(6).toString('hex')}`
 }
