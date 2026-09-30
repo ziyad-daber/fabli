@@ -96,10 +96,12 @@ Accéder à: **http://localhost:3000**
 fabli/
 ├── prisma/
 │   ├── schema.prisma      # Schéma de base de données (22 models, 8 enums)
-│   ├── seed.ts            # Données de test
-│   ├── migrations/        # Fichiers de migration (commis au git)
+│   └── seed.ts            # Données de test
+├── migrations/            # Fichiers de migration (commis au git, racine du dépôt)
+│   ├── 20260928151600_init/
+│   ├── 20260930190000_cities_reset_and_manual_shipment/
 │   └── migration_lock.toml
-├── prisma.config.ts       # Configuration Prisma 8 (datasource URL)
+├── prisma.config.ts       # Configuration Prisma 8 (datasource URL + chemin des migrations)
 ├── src/
 │   ├── app/               # Pages Next.js (App Router)
 │   │   ├── api/           # Routes API
@@ -167,7 +169,7 @@ npm run db:studio
 
 ### Production (VPS / Serveur Propre)
 
-**Fichiers de migration sont commités dans `prisma/migrations/`** - Ne pas exécuter `prisma migrate dev` en production.
+**Fichiers de migration sont commités dans `migrations/`** - Ne pas exécuter `prisma migrate dev` en production.
 
 #### Variables d'environnement requises sur le serveur:
 
@@ -366,4 +368,4 @@ Propriétaire - Fabli 2026
 
 ---
 
-**Note:** Ce projet utilise Prisma 8 (8.1.0-dev.7) avec l'adaptateur PostgreSQL pour le connection pooling. Les migrations sont versionnées dans `prisma/migrations/` et déployées avec `prisma migrate deploy` en production.
+**Note:** Ce projet utilise Prisma 8 (8.1.0-dev.7) avec l'adaptateur PostgreSQL pour le connection pooling. Les migrations sont versionnées dans `migrations/` et déployées avec `prisma migrate deploy` en production.

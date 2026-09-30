@@ -35,8 +35,8 @@ yarn-error.log*
 next-env.d.ts
 
 # prisma
-# prisma/migrations/ is deliberately NOT ignored: the SQL migrations are the
-# authoritative source of the schema and must be versioned.
+# migrations/ (project root) is deliberately NOT ignored: the SQL migrations are
+# the authoritative source of the schema and must be versioned.
 
 # docker
 docker-compose.override.yml
