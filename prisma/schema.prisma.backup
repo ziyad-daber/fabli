@@ -1,0 +1,44 @@
+model NotificationLog {
+  id        String   @id @default(uuid())
+  userId    String?
+  type      String   // "EMAIL", "SMS", "WHATSAPP", "IN_APP"
+  recipient String
+  subject   String?
+  body      String
+  status    String   // "PENDING", "SENT", "FAILED", "DELIVERED"
+  error     String?
+  metadata  Json?
+  sentAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+model ApiLog {
+  id            String   @id @default(uuid())
+  integrationId String
+  shipmentId    String?
+  method        String   // HTTP method
+  endpoint      String
+  requestBody   Json?
+  responseBody  Json?
+  statusCode    Int?
+  errorMessage  String?
+  durationMs    Int?
+  createdAt     DateTime @default(now())
+
+  integration   CourierIntegration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+  shipment      Shipment?          @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+
+  @@index([integrationId, createdAt])
+  @@index([shipmentId])
+}
+
+model PlatformSetting {
+  key         String   @id
+  value       String
+  description String?
+  updatedAt   DateTime @updatedAt
+  updatedBy   String?
+}
