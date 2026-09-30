@@ -6,22 +6,23 @@ Plateforme de mise en relation entre fournisseurs d'impression 3D et revendeurs 
 
 - **Frontend:** Next.js 14 (App Router) + TypeScript
 - **Database:** PostgreSQL 16
-- **ORM:** Prisma 5
+- **ORM:** Prisma 8 (with `@prisma/adapter-pg` for connection pooling)
 - **Auth:** NextAuth.js v5 (Credentials)
 - **Styling:** Tailwind CSS + Radix UI
-- **Deployment:** Docker Compose + Nginx + Let's Encrypt
+- **Deployment:** VPS with PostgreSQL + Nginx (or Docker Compose)
 
 ## 📋 Prérequis
 
-- Docker & Docker Compose
-- Node.js 20+ (pour développement local)
-- Nom de domaine configuré (pour HTTPS)
+- Node.js 20+
+- PostgreSQL 16+ (local or remote)
+- Nom de domaine configuré (pour HTTPS en production)
 
 ## 🛠 Installation Locale
 
 ### 1. Cloner et configurer
 
 ```bash
+git clone https://github.com/ziyad-daber/fabli.git
 cd fabli
 cp .env.example .env
 # Éditer .env avec vos valeurs
@@ -30,8 +31,8 @@ cp .env.example .env
 ### 2. Variables d'environnement
 
 ```env
-# Database
-DATABASE_URL="postgresql://fabli:VOTRE_MOT_DE_PASSE@localhost:5432/fabli"
+# Database - PostgreSQL (local, Neon, Supabase, Railway, or your VPS)
+DATABASE_URL="postgresql://user:password@host:5432/database?sslmode=require"
 
 # NextAuth
 NEXTAUTH_SECRET="GENERER_AVEC: openssl rand -base64 32"
@@ -39,53 +40,66 @@ NEXTAUTH_URL="http://localhost:3000"
 
 # App
 NODE_ENV="development"
+NEXT_TELEMETRY_DISABLED=1
 DOMAIN="localhost"
 
-# AMEEX (configuré plus tard par admin)
+# AMEEX (configuré par admin dans le dashboard)
 AMEEX_BASE_URL="https://api.ameex.ma"
 AMEEX_TEST_MODE="true"
+
+# Email/SMS (optionnel)
+SMTP_HOST=""
+SMTP_PORT="587"
+SMTP_USER=""
+SMTP_PASSWORD=""
+SMTP_FROM="noreply@your-domain.com"
+TWILIO_ACCOUNT_SID=""
+TWILIO_AUTH_TOKEN=""
+TWILIO_PHONE_NUMBER=""
 ```
 
-### 3. Démarrer avec Docker Compose (base de données locale)
+### 3. Initialiser la base de données
 
 ```bash
-# Construire et démarrer
-docker-compose up -d --build
+# Installer les dépendances
+npm install
 
-# Voir les logs
-docker-compose logs -f app
+# Générer le client Prisma
+npm run db:generate
 
-# Arrêter
-docker-compose down
-```
+# Appliquer le schéma (développement)
+npm run db:push
 
-**Note pour Supabase:** Si vous utilisez Supabase, commentez ou supprimez le service `postgres` dans `docker-compose.yml` et définissez la variable `DATABASE_URL` avec votre URL Supabase.
-
-### 4. Initialiser la base de données
-
-```bash
-# Exécuter les migrations
-docker-compose exec app npx prisma migrate deploy
+# OU créer une migration (si modification schéma)
+npm run db:migrate
 
 # Peupler avec des données de test
-docker-compose exec app npm run db:seed
+npm run db:seed
 ```
 
-### 5. Accéder à l'application
+### 4. Démarrer le serveur de développement
 
-- **Local:** http://localhost:3000
-- **Comptes de test:**
-  - Admin: `admin@fabli.ma` / `Admin123!`
-  - Fournisseur: `fournisseur@test.ma` / `Supplier123!`
-  - Revendeur: `revendeur@test.ma` / `Reseller123!`
+```bash
+npm run dev
+```
+
+Accéder à: **http://localhost:3000**
+
+**Comptes de test:**
+- Admin: `admin@fabli.ma` / `Admin123!`
+- Fournisseur: `fournisseur@test.ma` / `Supplier123!`
+- Revendeur: `revendeur@test.ma` / `Reseller123!`
 
 ## 🏗 Structure du Projet
 
 ```
 fabli/
 ├── prisma/
-│   ├── schema.prisma      # Schéma de base de données
-│   └── seed.ts            # Données de test
+│   ├── schema.prisma      # Schéma de base de données (22 models, 8 enums)
+│   ├── seed.ts            # Données de test
+│   ├── migrations/        # Fichiers de migration (commis au git)
+│   └── migration_lock.toml
+├── prisma.config.ts       # Configuration Prisma 8 (datasource URL)
 ├── src/
 │   ├── app/               # Pages Next.js (App Router)
 │   │   ├── api/           # Routes API
@@ -100,17 +114,18 @@ fabli/
 │   │   ├── forms/         # Composants de formulaires
 │   │   └── layout/        # Composants de mise en page
 │   ├── lib/
-│   │   ├── auth/          # Configuration NextAuth
-│   │   ├── db/            # Client Prisma
+│   │   ├── auth/          # Configuration NextAuth (Edge-safe)
+│   │   ├── db/            # Client Prisma (singleton + pg adapter)
 │   │   ├── ameex/         # Adaptateur AMEEX
 │   │   └── utils/         # Utilitaires
 │   ├── hooks/             # Hooks React personnalisés
 │   └── types/             # Types TypeScript
-├── docker/
-│   ├── app/Dockerfile     # Image Next.js
-│   └── nginx/             # Configuration Nginx
-├── docker-compose.yml     # Orchestration
-└── .env.example           # Variables d'environnement exemple
+├── deploy.sh              # Script déploiement Linux/macOS
+├── deploy.bat             # Script déploiement Windows
+├── docker-compose.yml     # Orchestration (optionnel)
+├── .env.example           # Variables d'environnement exemple
+├── .gitignore
+└── package.json
 ```
 
 ## 🔐 Rôles et Permissions
@@ -123,103 +138,115 @@ fabli/
 
 ## 📦 Fonctionnalités MVP
 
-- ✅ Authentification + RBAC
-- ✅ Produits (CRUD fournisseur)
+- ✅ Authentification + RBAC (Edge-safe middleware)
+- ✅ Produits (CRUD fournisseur, slug unique par fournisseur)
 - ✅ Catalogue (recherche, filtres revendeur)
-- ✅ Commandes (création, statuts)
+- ✅ Commandes (création, statuts, historique)
 - ✅ Commissions (calcul, snapshot prix)
-- ✅ COD tracking
-- ⏳ Expéditions AMEEX (adapter placeholder)
-- ⏳ Tableau de bord admin
+- ✅ COD tracking (collection, règlement)
+- ⏳ Expéditions AMEEX (adapter + webhook HMAC)
+- ⏳ Tableau de bord admin (analytics, règlements)
 
-## 🏗 Déploiement Production (Local PostgreSQL)
+## 🗄️ Base de Données & Migrations
 
-### 1. Serveur Linux (Ubuntu/Debian)
+### Développement Local
 
 ```bash
-# Installer Docker
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
+# Créer une nouvelle migration après modification du schéma
+npm run db:migrate
 
-# Installer Docker Compose
-sudo apt install docker-compose-plugin
+# Appliquer le schéma sans migration (rapide, dev seulement)
+npm run db:push
+
+# Voir l'état des migrations
+npx prisma migrate status
+
+# Studio Prisma (GUI)
+npm run db:studio
 ```
 
-### 2. Configurer le domaine
+### Production (VPS / Serveur Propre)
 
-```bash
-# Sur votre registrar DNS, créer:
-# A     @         VOTRE_IP_SERVEUR
-# A     www       VOTRE_IP_SERVEUR
-```
+**Fichiers de migration sont commités dans `prisma/migrations/`** - Ne pas exécuter `prisma migrate dev` en production.
 
-### 3. Variables de production
+#### Variables d'environnement requises sur le serveur:
 
-```bash
-# Sur le serveur
-mkdir -p /opt/fabli
-cd /opt/fabli
-
-# Copier docker-compose.yml et dossiers docker/
-# Créer .env de production
-cat > .env << EOF
-DATABASE_URL="postgresql://fabli:MOT_DE_PASSE_SECURISE@postgres:5432/fabli"
+```env
+DATABASE_URL="postgresql://user:password@host:5432/database?sslmode=require"
 NEXTAUTH_SECRET="MOT_DE_PASSE_TRES_LONG_GENERE_ALEATOIRE"
 NEXTAUTH_URL="https://votre-domaine.com"
 NODE_ENV="production"
+NEXT_TELEMETRY_DISABLED=1
 DOMAIN="votre-domaine.com"
 AMEEX_BASE_URL="https://api.ameex.ma"
 AMEEX_TEST_MODE="false"
-# ... autres variables
-EOF
 ```
 
-### 4. Déployer
+#### Commandes de déploiement production:
 
 ```bash
-# Première fois
-docker-compose -f docker-compose.yml up -d --build
+# 1. Cloner le repo
+git clone https://github.com/ziyad-daber/fabli.git
+cd fabli
 
-# Migrations
-docker-compose exec app npx prisma migrate deploy
+# 2. Configurer .env avec les variables de production
 
-# Seed (optionnel)
-docker-compose exec app npm run db:seed
+# 3. Déployer (utilise le script ou manuellement)
+./deploy.sh
+
+# OU manuellement:
+npm ci --production=false
+npx prisma generate
+npx prisma migrate deploy    # ÉCHOUe si DB indisponible ou migrations en échec
+npm run db:seed              # Optionnel: SEED_DATABASE=true npm run db:seed
+npm run build
+
+# 4. Démarrer (avec PM2 recommandé)
+npm start
+# OU
+pm2 start npm --name fabli -- start
+pm2 save
+pm2 startup
 ```
 
-### 5. SSL avec Let's Encrypt
-
-Le certbot est inclus dans docker-compose. Il renouvellera automatiquement.
+#### Script de déploiement automatisé:
 
 ```bash
-# Forcer le premier certificat
-docker-compose run --rm certbot certonly \
-  --webroot -w /var/www/certbot \
-  -d votre-domaine.com -d www.votre-domaine.com \
-  --email admin@votre-domaine.com --agree-tos --no-eff-email
+# Linux/macOS
+chmod +x deploy.sh
+./deploy.sh
+
+# Windows
+deploy.bat
+
+# Avec seed initial (premier déploiement seulement)
+SEED_DATABASE=true ./deploy.sh
 ```
 
-### 6. Commandes utiles
+Le script `deploy.sh` / `deploy.bat`:
+- ✅ Valide toutes les variables d'environnement requises
+- ✅ Installe les dépendances
+- ✅ Génère Prisma Client
+- ✅ Exécute `prisma migrate deploy` (échoue clairement si DB inaccessible)
+- ✅ Build l'application Next.js
+- ✅ Ne JAMAIS exécute `migrate dev` en production
+
+## 🐳 Déploiement avec Docker Compose (Alternative)
+
+Si vous préférez Docker pour la base de données locale:
 
 ```bash
-# Logs
-docker-compose logs -f app
-docker-compose logs -f nginx
+# Démarrer PostgreSQL uniquement
+docker-compose up -d postgres
 
-# Redémarrer l'app
-docker-compose restart app
-
-# Backup DB
-docker-compose exec postgres pg_dump -U fabli fabli > backup_$(date +%Y%m%d).sql
-
-# Restore DB
-cat backup.sql | docker-compose exec -T postgres psql -U fabli fabli
-
-# Mettre à jour
-git pull
-docker-compose up -d --build
-docker-compose exec app npx prisma migrate deploy
+# Puis commandes normales
+npm run db:generate
+npm run db:migrate:deploy
+npm run db:seed
+npm run dev
 ```
+
+**Note:** Pour Supabase/Neon/Railway, commentez le service `postgres` dans `docker-compose.yml` et utilisez leur `DATABASE_URL`.
 
 ## 🔧 Développement
 
@@ -241,6 +268,12 @@ npm run test
 
 # Prisma Studio
 npm run db:studio
+
+# Nouvelles migrations (dev)
+npm run db:migrate
+
+# Reset DB (dev only - DANGER)
+npx prisma migrate reset
 ```
 
 ## 📊 Modèle de Données Principal
@@ -248,66 +281,84 @@ npm run db:studio
 - **Users** + Profils (Fournisseur/Revendeur)
 - **Products** + Variantes + Images
 - **Orders** + Items (prix snapshottés)
-- **Shipments** (Code Suivi AMEEX)
+- **Shipments** (Code Suivi AMEEX, idempotency)
 - **Commissions** + **Settlements** (règlements fournisseurs)
 - **COD Collections** (suivi encaissement)
+- **CourierIntegration** + **CourierApiLog** (AMEEX)
 - **Audit Logs** + **Notifications**
+- **PlatformSettings** (config dynamique)
 
 ## 🔌 Intégration AMEEX
 
-L'adaptateur dans `src/lib/ameex/adapter.ts` est un **placeholder**. 
+L'adaptateur dans `src/lib/ameex/adapter.ts` implémente:
+- Création expédition (pickup, package, products, recipient, COD)
+- Suivi statut / tracking
+- Édition / relance expédition
+- Tracking multiple
+- Vérification HMAC webhook
 
-Avant production, implémenter selon la doc officielle:
-https://documenter.getpostman.com/view/10265205/2sA3rwLZD1
+Configuration via dashboard admin → `/dashboard/admin/ameex`
 
-Points à confirmer avec AMEEX:
-- Authentification (API Key / OAuth / JWT)
-- Endpoints exacts
-- Format Code Suivi
-- Webhooks disponibles
-- Gestion COD
-- Idempotency
-
-## 📝 Scripts Utiles
+## 📝 Scripts NPM Disponibles
 
 ```bash
-# Nouvelles migrations
-npm run db:migrate
+# Développement
+npm run dev              # Next.js dev server
+npm run lint             # ESLint
+npm run typecheck        # TypeScript check
 
-# Appliquer migrations prod
-npm run db:migrate:deploy
+# Base de données
+npm run db:generate      # prisma generate
+npm run db:migrate       # prisma migrate dev (créer migration)
+npm run db:migrate:deploy # prisma migrate deploy (PRODUCTION)
+npm run db:push          # prisma db push (dev rapide)
+npm run db:seed          # tsx prisma/seed.ts
+npm run db:studio        # prisma studio
 
-# Reset DB (dev only)
-npx prisma migrate reset
-
-# Générer client Prisma
-npm run db:generate
+# Build/Deploy
+npm run build            # prisma generate + next build
+npm start                # node .next/standalone/server.js
 ```
 
 ## 🐛 Dépannage
 
 ### Base de données inaccessible
 ```bash
-docker-compose exec postgres pg_isready -U fabli
+# Vérifier connexion
+psql "$DATABASE_URL" -c "SELECT 1;"
+
+# Ou avec Prisma
+npx prisma db execute --stdin <<< "SELECT 1;"
 ```
 
 ### Erreur de migration
 ```bash
-docker-compose exec app npx prisma migrate status
-docker-compose exec app npx prisma migrate resolve --rolled-back "migration_name"
+# Voir statut
+npx prisma migrate status
+
+# Résoudre migration bloquée (dernier recours)
+npx prisma migrate resolve --rolled-back "migration_name"
 ```
 
-### Certificat SSL
+### Échec build production
 ```bash
-docker-compose logs certbot
-docker-compose run --rm certbot certificates
+# Vérifier variables d'env
+cat .env
+
+# Nettoyer et rebuild
+rm -rf .next node_modules
+npm install
+npm run build
 ```
 
-### Nettoyage complet
-```bash
-docker-compose down -v
-docker system prune -a
-```
+## 🔒 Sécurité
+
+- ✅ `.env` dans `.gitignore` - jamais commité
+- ✅ Mots de passe hashés (bcrypt, 12 rounds)
+- ✅ NextAuth JWT sessions (Edge-compatible)
+- ✅ Middleware Edge-safe (pas de Prisma/bcrypt)
+- ✅ Validation Zod sur toutes les routes API
+- ✅ Prisma Prepared Statements (protection injection SQL)
 
 ## 📄 Licence
 
@@ -315,4 +366,4 @@ Propriétaire - Fabli 2026
 
 ---
 
-**Note:** Ce projet est en développement actif. L'intégration AMEEX réelle nécessite la documentation API confirmée.
+**Note:** Ce projet utilise Prisma 8 (8.1.0-dev.7) avec l'adaptateur PostgreSQL pour le connection pooling. Les migrations sont versionnées dans `prisma/migrations/` et déployées avec `prisma migrate deploy` en production.
